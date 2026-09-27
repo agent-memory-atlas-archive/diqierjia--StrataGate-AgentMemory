@@ -63,7 +63,9 @@ function recordUseResult(turn: number, seq: number, callId: string) {
 
 describe('DSH answer-tail timing', () => {
   it.each([4, 8])('renders a result at seq %i without a subsequent Turn', (resultSeq) => {
+    const dshChatPackage = JSON.parse(readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/package.json', import.meta.url), 'utf8'))
     const dshChat = readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js', import.meta.url), 'utf8')
+    expect(dshChatPackage.version).toBe('0.1.7-rc.2')
     expect(dshChat).toMatch(/"conversation\.chat\.turnTail":\s*\{\s*kind: "list"/)
     expect(dshChat).toContain('seq: closing?.finalNode.seq ?? data.seq')
 
@@ -115,6 +117,17 @@ describe('DSH short-term Block timing', () => {
     feed.listeners.add(listener)
     return { ...plugin.__test, feed, fetch, snapshots, listener }
   }
+
+  it('does not poll after the ordinary fifth turn of a six-turn Block', async () => {
+    const open = { activeThreadId: 'session-1', blockTurnSize: 6, items: [], total: 0, openBlock: { turnRange: [1, 5], turns: 5, capacity: 6 } }
+    const { feed, fetch, snapshots, listener, refreshShortTermFeed, shortTermTurnDisplay } = blockFeed([open])
+    await refreshShortTermFeed(feed, 'C:/project', '5:idle', true)
+    expect(shortTermTurnDisplay(snapshots.at(-1)?.payload?.data, 5)).toMatchObject({ kind: 'progress', current: 5, capacity: 6 })
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(fetch).toHaveBeenCalledTimes(1)
+    feed.listeners.delete(listener)
+  })
 
   it('finds the sixth-turn Block through missing, pending, and ready snapshots without Turn 7', async () => {
     const missing = { activeThreadId: 'session-1', blockTurnSize: 6, items: [], total: 0, openBlock: { turnRange: [1, 5], turns: 5, capacity: 6 } }

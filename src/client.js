@@ -881,8 +881,8 @@ window.__ModuleLoader__.load({
       const capacity = Number(open?.capacity || data.blockTurnSize || 6)
       const count = Number(open?.turns || 0)
       const lastTurn = Number(open?.turnRange?.[1])
-      return capacity > 0 && count >= capacity - 1
-        && (lastTurn === turn - 1 || lastTurn === turn)
+      return capacity > 0 && ((lastTurn === turn - 1 && count === capacity - 1)
+        || (lastTurn === turn && count >= capacity))
     }
 
     function scheduleShortTermPoll(feed) {
