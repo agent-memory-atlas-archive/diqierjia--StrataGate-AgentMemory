@@ -535,8 +535,12 @@ window.__ModuleLoader__.load({
 
     function parseToolResultJson(event) {
       if (event.type !== 'tool/result') return null
-      const result = event.data?.message?.content?.[0]
-      if (!result || result.isError === true || !Array.isArray(result.content)) return null
+      const message = event.data?.message
+      if (!message || message.isError === true || !Array.isArray(message.content)) return null
+      // Current DSH stores tool text directly; older sessions wrap it in tool_result.
+      const first = message.content[0]
+      const result = first?.type === 'tool_result' ? first : message
+      if (result.isError === true || !Array.isArray(result.content)) return null
       const text = result.content.find((block) => block?.type === 'text' && typeof block.text === 'string')?.text
       if (!text) return null
       try {

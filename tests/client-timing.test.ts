@@ -39,8 +39,8 @@ function loadClient(exportsForTest = '', extra: Record<string, unknown> = {}) {
   return { plugin, React }
 }
 
-function recordUseResult(turn: number, seq: number, callId: string) {
-  return {
+function recordUseResult(turn: number, seq: number, callId: string, format = 'legacy') {
+  const event = {
     type: 'tool/result', seq,
     data: {
       turn,
@@ -59,9 +59,59 @@ function recordUseResult(turn: number, seq: number, callId: string) {
       },
     },
   }
+  if (format === 'flat') {
+    const message = event.data.message as any
+    message.isError = false
+    message.content = message.content[0].content
+  }
+  return event
 }
 
-describe('DSH answer-tail timing', () => {
+describe.each(['legacy', 'flat'])('DSH answer-tail timing (%s)', (format) => {
+  it('rejects failed, malformed, unrecorded and unrelated results', () => {
+    const { plugin } = loadClient('parseMemoryRecordUseResult')
+    const parse = plugin.__test.parseMemoryRecordUseResult
+    const event = recordUseResult(18, 305, 'use-1', format)
+    expect(parse(event, new Set(['different-call']))).toBeNull()
+    for (const failure of ['message-error', 'result-error', 'invalid-json', 'not-recorded']) {
+      const invalid = structuredClone(event) as any
+      const message = invalid.data.message
+      const result = format === 'legacy' ? message.content[0] : message
+      if (failure === 'message-error') message.isError = true
+      if (failure === 'result-error') result.isError = true
+      if (failure === 'invalid-json') result.content[0].text = '{broken'
+      if (failure === 'not-recorded') {
+        const value = JSON.parse(result.content[0].text)
+        value.recorded = false
+        result.content[0].text = JSON.stringify(value)
+      }
+      expect(parse(invalid, new Set(['use-1']))).toBeNull()
+    }
+  })
+
+  it('retains retrieval order when batches are recorded in reverse order', () => {
+    const { plugin } = loadClient('memoryCitationsDefinition, selectMemoryCitations')
+    const definition = plugin.__test.memoryCitationsDefinition
+    let state = definition.start({}, { event: { type: 'turn/start', data: { turn: 18 } } })
+    const apply = (event: any) => { state = definition.update({ state }, { event }) }
+    for (const [index, id] of ['first', 'second'].entries()) {
+      apply({ type: 'tool/call', seq: index * 2 + 1, data: { turn: 18, callId: `search-${id}`, name: 'memory_search_events' } })
+      const result = recordUseResult(18, index * 2 + 2, `search-${id}`, format) as any
+      const message = result.data.message
+      const content = format === 'legacy' ? message.content[0].content : message.content
+      content[0].text = JSON.stringify({ batchId: `batch-${id}` })
+      apply(result)
+    }
+    for (const [index, id] of ['second', 'first'].entries()) {
+      apply({ type: 'tool/call', seq: 5 + index * 2, data: { turn: 18, callId: id, name: 'memory_record_use' } })
+      apply(recordUseResult(18, 6 + index * 2, id, format))
+    }
+    const location = definition.buildLocationData({ state }, 'turn')
+    const selected = plugin.__test.selectMemoryCitations({ turn: { turn: 18, end: { seq: 10 }, data: new Map([[location.key, location.value]]) }, seq: 9 })
+    expect(selected.retrievalGroups.map((group: any) => group.batchId)).toEqual(['batch-first', 'batch-second'])
+    expect(selected.citations).toHaveLength(2)
+  })
+
   it.each([4, 8])('renders a result at seq %i without a subsequent Turn', (resultSeq) => {
     const dshChatPackage = JSON.parse(readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/package.json', import.meta.url), 'utf8'))
     const dshChat = readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js', import.meta.url), 'utf8')
@@ -89,7 +139,7 @@ describe('DSH answer-tail timing', () => {
     const render = () => JSON.stringify(tail.render({ turn, seq: 5 })) // DSH list slot passes owner props, not matched.
     expect(render()).not.toContain('本回答采用了')
 
-    state = conversation.update({ state }, { event: recordUseResult(turnNumber, resultSeq, callId) })
+    state = conversation.update({ state }, { event: recordUseResult(turnNumber, resultSeq, callId, format) })
     location = conversation.buildLocationData({ state }, 'turn')
     expect(location.value.entries).toHaveLength(1)
     expect(render()).toContain('本回答采用了 1 条记忆')
@@ -98,7 +148,7 @@ describe('DSH answer-tail timing', () => {
 
     const futureCallId = `future-${resultSeq}`
     state = conversation.update({ state }, { event: { type: 'tool/call', seq: 11, data: { turn: turnNumber, callId: futureCallId, name: 'memory_record_use' } } })
-    state = conversation.update({ state }, { event: recordUseResult(turnNumber, 13, futureCallId) })
+    state = conversation.update({ state }, { event: recordUseResult(turnNumber, 13, futureCallId, format) })
     location = conversation.buildLocationData({ state }, 'turn')
     expect(render()).toContain('本回答采用了 1 条记忆')
   })
