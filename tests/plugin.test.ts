@@ -172,7 +172,7 @@ describe('DSH plugin composition', () => {
       }))
       expect(prompt.sections).toContainEqual(expect.objectContaining({
         name: 'tool:stratagate-memory',
-        text: expect.stringMatching(/memory_remember[\s\S]*long-term memory[\s\S]*conflict-marked/),
+        text: expect.stringMatching(/memory_profile_update[\s\S]*memory_remember[\s\S]*one place[\s\S]*conflict-marked/),
       }))
       expect(prompt.sections).toContainEqual(expect.objectContaining({
         name: 'tool:stratagate-feedback',
@@ -208,14 +208,14 @@ describe('DSH plugin composition', () => {
       const remember = ctx.tools.get('memory_remember')
       expect(search).toBeDefined()
       expect(profileUpdate).toBeDefined()
-      expect(profileUpdate!.description).toMatch(/explicitly asks[\s\S]*called immediately/)
-      expect(profileUpdate!.description).toMatch(/only infers[\s\S]*which field[\s\S]*new value[\s\S]*reply exactly "同意"[\s\S]*Only a directly subsequent "同意"/)
-      expect(profileUpdate!.description).toMatch(/refuses[\s\S]*changes the subject[\s\S]*do not perform the update/)
-      expect(profileUpdate!.description).toMatch(/belongs in Event memory[\s\S]*separate Event-memory tool/)
-      expect(profileUpdate!.description).toMatch(/preferredLanguage sets only the default language of the final\/user-facing answer[\s\S]*reasoningLanguage sets only the desired language of reasoning\/thinking text visible to the user/)
-      expect(profileUpdate!.description).toMatch(/以后都用中文回答我[\s\S]*preferredLanguage = 中文; do not change reasoningLanguage/)
-      expect(profileUpdate!.description).toMatch(/以后思考过程用中文[\s\S]*思考链用中文[\s\S]*reasoningLanguage = 中文; do not change preferredLanguage/)
-      expect(profileUpdate!.description).toMatch(/以后回答和思考过程都用中文[\s\S]*two separate memory_profile_update calls: first preferredLanguage = 中文, then reasoningLanguage = 中文/)
+      expect(profileUpdate!.description).toContain("用户明确要求修改时可直接执行")
+      expect(profileUpdate!.description).toContain("只有用户紧接着明确回复“同意”，才授权这一次修改")
+      expect(profileUpdate!.description).toContain("沉默、拒绝、换话题或提出不同修改都不算授权")
+      expect(profileUpdate!.description).toContain("只需在相关情境中想起的项目事实、经历、决定或偏好，请使用 memory_remember")
+      expect(profileUpdate!.description).toContain("默认回答语言只控制最终面向用户的回答")
+      expect(profileUpdate!.description).toContain("以后都用中文回答我")
+      expect(profileUpdate!.description).toContain("以后思考过程用中文")
+      expect(profileUpdate!.description).toContain("两者都要求时分别调用两次")
       conversationMessages.push({ id: 'profile-user-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '以后默认都用中文回复。' }] })
       expect(await profileUpdate!.execute({ field: 'preferredLanguage', value: '中文' }, { agent, callId: 'profile-call' } as never))
         .toEqual({ field: 'preferredLanguage', value: '中文', modified: true })
@@ -265,7 +265,8 @@ describe('DSH plugin composition', () => {
       expect(feedbackPrepare).toBeDefined()
       expect(recordUse).toBeDefined()
       expect(remember).toBeDefined()
-      expect(remember!.description).toMatch(/durable long-term StrataGate memory[\s\S]*conflict-marked/)
+      expect(remember!.description).toContain("保存的信息会按相关性被检索或提供给后续对话")
+      expect(remember!.description).toContain("同一信息默认只写入一处")
       const remembered = await remember!.execute({
         content: '用户偏好 pnpm 作为包管理器。',
         category: 'preference',

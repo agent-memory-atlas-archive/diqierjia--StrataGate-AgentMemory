@@ -91,8 +91,10 @@ Every explicit retrieval creates an independent batch. The model passes its `bat
 
 ### Agent-recorded memory
 
-`memory_remember` lets the agent record facts proactively: explicit user preferences or
-corrections, decisions, durable project facts, or anything the user asks to remember.
+Choose by scope: `memory_profile_update` changes a global Persistent Profile field supplied to every future conversation without retrieval; `memory_remember` stores an Event surfaced when relevant, such as a project-specific preference or a past decision. A one-turn request needs neither. The word "remember" does not select a tool, and the same information should normally be stored in one place. An inferred Profile change still requires the consent specified by that tool.
+
+`memory_remember` lets the agent record facts proactively: context-specific user preferences or
+corrections, decisions, and durable project facts when they need to be recalled in relevant situations.
 Recordings enter the same long-term Event pipeline as conversation-derived memory, with
 two differences:
 
