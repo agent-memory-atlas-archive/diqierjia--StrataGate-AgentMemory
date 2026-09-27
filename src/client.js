@@ -492,13 +492,14 @@ window.__ModuleLoader__.load({
     function selectMemoryCitations(owner) {
       const data = owner.turn.data.get(MEMORY_CITATIONS_KIND)
       const entries = Array.isArray(data?.entries) ? data.entries : []
+      const cutoffSeq = Number.isSafeInteger(owner.turn.end?.seq) ? owner.turn.end.seq : owner.seq
       const selected = []
       const seen = new Set()
       const retrievalGroups = []
       const seenGroups = new Set()
       let retrievedCount = 0
       for (const entry of entries) {
-        if (entry.seq > owner.seq || !Array.isArray(entry.citations)) continue
+        if (entry.seq > cutoffSeq || !Array.isArray(entry.citations)) continue
         const groupCount = Number.isInteger(entry.retrievedCount) && entry.retrievedCount >= 0 ? entry.retrievedCount : entry.citations.length
         const groupKey = String(entry.batchId || 'legacy:' + entry.seq)
         if (!seenGroups.has(groupKey)) {
@@ -786,6 +787,7 @@ window.__ModuleLoader__.load({
     }
 
     const shortTermMemoryFeeds = new Map()
+    const SHORT_TERM_POLL_WINDOW_MS = 120_000
 
     function shortTermLayerName(level) {
       return ['索引', '摘要', '关键事实', '精简对话', '近原文', '原文'][Number(level)] || '会话视图'
@@ -806,6 +808,8 @@ window.__ModuleLoader__.load({
         queuedWorkspacePath: '',
         queuedSignal: '',
         pollTimer: null,
+        pollSignal: '',
+        pollUntil: 0,
       }
       shortTermMemoryFeeds.set(sessionId, feed)
       return feed
@@ -864,13 +868,25 @@ window.__ModuleLoader__.load({
         && settingsSnapshot?.value?.showRetrievalStatus !== false
     }
 
-    function shortTermNeedsPolling(payload) {
-      return shortTermBlocks(payload?.data).some((block) => block.processingStatus === 'pending'
-        && block.summaryJob?.status !== 'failed')
+    function shortTermNeedsPolling(payload, signal) {
+      const data = payload?.data
+      const blocks = shortTermBlocks(data)
+      if (blocks.some((block) => block.processingStatus === 'pending'
+        && (block.summaryJob?.status !== 'failed' || block.summaryJob?.nextRetryAt))) return true
+      const match = /^(\d+):idle$/.exec(signal)
+      if (!match || !data) return false
+      const turn = Number(match[1])
+      if (blocks.some((block) => Number(block.turnRange?.[1]) === turn)) return false
+      const open = data.openBlock
+      const capacity = Number(open?.capacity || data.blockTurnSize || 6)
+      const count = Number(open?.turns || 0)
+      const lastTurn = Number(open?.turnRange?.[1])
+      return capacity > 0 && count >= capacity - 1
+        && (lastTurn === turn - 1 || lastTurn === turn)
     }
 
     function scheduleShortTermPoll(feed) {
-      if (feed.pollTimer !== null || feed.listeners.size === 0) return
+      if (feed.pollTimer !== null || feed.listeners.size === 0 || Date.now() >= feed.pollUntil) return
       feed.pollTimer = window.setTimeout(() => {
         feed.pollTimer = null
         void refreshShortTermFeed(feed, feed.workspacePath, feed.signal, true)
@@ -893,10 +909,20 @@ window.__ModuleLoader__.load({
       }
       const workspaceChanged = feed.workspacePath !== workspacePath
       if (!force && !workspaceChanged && feed.signal === signal && feed.snapshot.payload) return feed.request || Promise.resolve()
+      if (feed.pollSignal !== signal || workspaceChanged) {
+        feed.pollSignal = signal
+        feed.pollUntil = Date.now() + SHORT_TERM_POLL_WINDOW_MS
+      }
       if (feed.request) {
-        feed.queuedWorkspacePath = workspacePath
-        feed.queuedSignal = signal
+        if (workspaceChanged || feed.signal !== signal) {
+          feed.queuedWorkspacePath = workspacePath
+          feed.queuedSignal = signal
+        }
         return feed.request
+      }
+      if (feed.pollTimer !== null) {
+        window.clearTimeout(feed.pollTimer)
+        feed.pollTimer = null
       }
       if (workspaceChanged) {
         feed.workspacePath = workspacePath
@@ -917,7 +943,7 @@ window.__ModuleLoader__.load({
       }).then((data) => {
         const payload = data?.activeThreadId === feed.sessionId ? { namespace: feed.namespace, data } : null
         publishShortTermFeed(feed, { payload, loading: false, error: '' })
-        if (shortTermNeedsPolling(feed.snapshot.payload)) scheduleShortTermPoll(feed)
+        if (shortTermNeedsPolling(feed.snapshot.payload, feed.signal)) scheduleShortTermPoll(feed)
       }).catch((reason) => {
         if (reason?.name !== 'AbortError') publishShortTermFeed(feed, { loading: false, error: String(reason?.message || reason) })
       }).finally(() => {
@@ -966,6 +992,8 @@ window.__ModuleLoader__.load({
             }
             feed.controller?.abort()
             feed.controller = null
+            feed.queuedWorkspacePath = ''
+            feed.queuedSignal = ''
           }
         }
       }, [feed])
