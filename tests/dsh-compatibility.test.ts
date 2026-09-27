@@ -11,10 +11,11 @@ const common = {
   '@deepseek-ai/schemastery': '3.18.2',
 } as const
 
-function versions(version: '0.1.2-rc.1' | '0.1.5-rc.2' | '0.1.6-alpha.1' | '0.1.7-rc.1'): DshRuntimePackageVersions {
+function versions(version: string): DshRuntimePackageVersions {
   return {
     ...common,
-    ...(version === '0.1.7-rc.1' ? { '@deepseek-ai/cordis': '4.0.4', '@deepseek-ai/schemastery': '3.18.4' } : {}),
+    ...((version === '0.1.7' || version.startsWith('0.1.7-'))
+      ? { '@deepseek-ai/cordis': '4.0.4', '@deepseek-ai/schemastery': '3.18.4' } : {}),
     '@deepseek-ai/dsh-agent-default-model': version,
     '@deepseek-ai/dsh-client-ui-conversation': version,
     '@deepseek-ai/dsh-llm': version,
@@ -43,6 +44,33 @@ describe('DSH runtime compatibility', () => {
     expect(classifyDshRuntime(versions('0.1.7-rc.1')).cliVersion).toBe('0.1.7-rc.1')
   })
 
+  it('accepts the actual 0.1.7-rc.2 host family', () => {
+    expect(classifyDshRuntime(versions('0.1.7-rc.2')).cliVersion).toBe('0.1.7-rc.2')
+  })
+
+  it('accepts a coherent later 0.1.7 host with compatible Cordis and Schemastery patches', () => {
+    const future = {
+      ...versions('0.1.7-rc.3'),
+      '@deepseek-ai/cordis': '4.0.5',
+      '@deepseek-ai/schemastery': '3.18.5',
+    }
+    expect(classifyDshRuntime(future).cliVersion).toBe('0.1.7-rc.3')
+    expect(classifyDshRuntime(versions('0.1.7')).cliVersion).toBe('0.1.7')
+  })
+
+  it('does not accept a new DSH patch family or a mixed future runtime', () => {
+    expect(() => classifyDshRuntime(versions('0.1.8'))).toThrow(/unsupported or mixed core runtime/)
+    const mixed = { ...versions('0.1.7-rc.3'), '@deepseek-ai/dsh-tools': '0.1.7-rc.2' }
+    expect(() => classifyDshRuntime(mixed)).toThrow(/unsupported or mixed core runtime/)
+  })
+
+  it('rejects a future runtime with an incompatible Cordis or Schemastery version', () => {
+    expect(() => classifyDshRuntime({ ...versions('0.1.7-rc.3'), '@deepseek-ai/cordis': '4.1.0' }))
+      .toThrow(/unsupported or mixed core runtime/)
+    expect(() => classifyDshRuntime({ ...versions('0.1.7-rc.3'), '@deepseek-ai/schemastery': '3.19.0' }))
+      .toThrow(/unsupported or mixed core runtime/)
+  })
+
   it('rejects a 0.1.5-rc.2 dependency family mixed with dsh-session 0.1.2-rc.1', () => {
     const mixed = { ...versions('0.1.5-rc.2'), '@deepseek-ai/dsh-session': '0.1.2-rc.1' }
     expect(() => classifyDshRuntime(mixed)).toThrow(/unsupported or mixed core runtime/)
@@ -62,14 +90,17 @@ describe('DSH runtime compatibility', () => {
   })
 
   it('rejects a mixed native-command runtime', () => {
-    const mixed = { ...versions('0.1.7-rc.1'), '@deepseek-ai/dsh-native-command': '0.1.6-alpha.1' }
+    const mixed = { ...versions('0.1.7-rc.2'), '@deepseek-ai/dsh-native-command': '0.1.7-rc.1' }
     expect(() => classifyDshRuntime(mixed)).toThrow(/unsupported or mixed core runtime/)
-    expect(() => classifyDshRuntime(mixed)).toThrow(/dsh-native-command@0\.1\.6-alpha\.1/)
+    expect(() => classifyDshRuntime(mixed)).toThrow(/dsh-native-command@0\.1\.7-rc\.1/)
   })
 
   it('uses the producer-owned source kind only for DSH 0.1.7', () => {
     expect(buildDshMessageSource('0.1.6-alpha.1')).toEqual({ kind: 'plugin', plugin: 'stratagate-memory' })
     expect(buildDshMessageSource('0.1.7-rc.1')).toEqual({ kind: 'plugin:stratagate-memory' })
+    expect(buildDshMessageSource('0.1.7-rc.2')).toEqual({ kind: 'plugin:stratagate-memory' })
+    expect(buildDshMessageSource('0.1.7-rc.3')).toEqual({ kind: 'plugin:stratagate-memory' })
+    expect(buildDshMessageSource('0.1.7')).toEqual({ kind: 'plugin:stratagate-memory' })
     expect(buildDshMessageSource('0.1.7-rc.1', 'instructions')).toEqual({ kind: 'plugin:stratagate-memory', form: 'instructions' })
   })
 
@@ -78,5 +109,6 @@ describe('DSH runtime compatibility', () => {
     expect(buildDshReplaceSurfaceOp('0.1.5-rc.2', 2, 5)).toEqual({ op: 'replace', startSeq: 2, endSeq: 5 })
     expect(buildDshReplaceSurfaceOp('0.1.6-alpha.1', 2, 5)).toEqual({ op: 'replace', startSeq: 2, endSeq: 5 })
     expect(buildDshReplaceSurfaceOp('0.1.7-rc.1', 2, 5)).toEqual({ op: 'replace', startSeq: 2, endSeq: 5 })
+    expect(buildDshReplaceSurfaceOp('0.1.7-rc.2', 2, 5)).toEqual({ op: 'replace', startSeq: 2, endSeq: 5 })
   })
 })
