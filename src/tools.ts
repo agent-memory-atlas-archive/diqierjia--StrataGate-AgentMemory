@@ -21,22 +21,15 @@ function sessionOf(exec: ToolRunContext): Session {
 export function registerMemoryTools(ctx: Context, runtime: StrataGateRuntime): void {
   ctx.tools.register(defineTool({
     name: 'memory_profile_update',
-    description: `This tool is provided by the StrataGate plugin. Update exactly one field of the user's global Persistent Profile. Persistent Profile data is injected into every future conversation without retrieval, so use this tool only for information that should remain continuously available or continuously affect future behavior, such as how to address the user, what the user wants the assistant to be called, language preferences, stable response preferences, standing instructions, stable user background, long-term goals, or other genuinely persistent notes.
+    description: `This tool is provided by the StrataGate plugin. 修改用户常驻画像中的一个固定字段：用户称呼、助手名字、默认回答语言、思考过程语言、回复方式和风格偏好、长期持续生效的要求、稳定的用户背景、长期目标，或其他必须常驻的信息。
 
-preferredLanguage sets only the default language of the final/user-facing answer. reasoningLanguage sets only the desired language of reasoning/thinking text visible to the user in the DSH or host UI, when supported; it cannot control hidden internal chain-of-thought. An empty reasoningLanguage adds no visible-reasoning language requirement. These are independent settings: never infer one from the other, and never change one merely because the other changed.
+这些信息会自动提供给后续每次对话，无需检索。只有确实需要持续放在上下文中的信息，才适合写入画像。
 
-Examples:
-User: “以后都用中文回答我” → call memory_profile_update with preferredLanguage = 中文; do not change reasoningLanguage.
-User: “以后思考过程用中文” or “思考链用中文” → call memory_profile_update with reasoningLanguage = 中文; do not change preferredLanguage.
-User: “以后回答和思考过程都用中文” → make two separate memory_profile_update calls: first preferredLanguage = 中文, then reasoningLanguage = 中文. Each call still changes exactly one field.
+默认回答语言只控制最终面向用户的回答；思考过程语言只控制宿主界面支持时用户可见的思考文本，不控制隐藏推理。两者是独立字段，只修改用户指定的字段。例如“以后都用中文回答我”只修改 preferredLanguage，“以后思考过程用中文”只修改 reasoningLanguage；两者都要求时分别调用两次。
 
-Do not use this tool merely because the user says "remember". If the information describes something that happened, a decision, an activity, a project change, a dated fact, or something that only needs to be recalled when relevant, it belongs in Event memory instead. A separate Event-memory tool is reserved for that purpose and is not part of this implementation.
+每次调用只修改一个已有字段，不新增、删除或改名字段，也不为修改一个字段重写整份画像。用户明确要求修改时可直接执行；如果是你主动建议修改，须先说明具体字段和新值。只有用户紧接着明确回复“同意”，才授权这一次修改；沉默、拒绝、换话题或提出不同修改都不算授权。
 
-When the user explicitly asks to make a persistent change, that request is already authorization and the tool may be called immediately.
-
-If the assistant only infers that something might be a useful persistent preference or profile fact, it must not update the profile immediately. It must first tell the user exactly which field it proposes to change and what the new value would be, and ask the user to reply exactly "同意". Only a directly subsequent "同意" authorizes that single proposed change. If the user refuses, does not reply "同意", changes the subject, or proposes a different change, do not perform the update.
-
-Each call changes exactly one predefined Profile field. Never create, delete, or rename Profile fields, and never rewrite the complete Profile when only one field is being changed.`,
+只需在相关情境中想起的项目事实、经历、决定或偏好，请使用 memory_remember；仅本次有效的要求不写入记忆。不能因为用户说了“记住”就自动选择本工具，也不能在 memory_remember 不可用时把 Event 信息改写成常驻画像。`,
     parameters: {
       field: { type: 'string', required: true, enum: ['userPreferredName', 'assistantPreferredName', 'preferredLanguage', 'reasoningLanguage', 'responsePreferences', 'standingInstructions', 'userBackground', 'longTermGoals', 'persistentNotes'] as const },
       value: { type: 'string', required: true },
@@ -218,7 +211,13 @@ Each call changes exactly one predefined Profile field. Never create, delete, or
   if (runtime.agentMemoryEnabled) {
     ctx.tools.register(defineTool({
       name: 'memory_remember',
-      description: 'This tool is provided by the StrataGate plugin. Record one memorable fact as a durable long-term StrataGate memory: explicit user preferences or corrections, decisions the user makes, durable project facts, or anything the user asks you to remember. StrataGate checks existing memory first — exact or near duplicates reinforce the existing card instead of writing, related facts may be merged, supersede an outdated card, or be conflict-marked; the result reports the action. Recorded facts are ordinary Events: they participate in the knowledge graph, persist across sessions, are retrievable with memory_search_events, decay and reinforce through the normal lifecycle. Keep each call to one self-contained sentence; never record secrets, credentials, or transient task state.',
+      description: `This tool is provided by the StrataGate plugin. 主动保存一条对未来有价值、适合在相关情境中回忆的信息，例如项目事实、已经做出的决定、重要经历、事实纠正，以及特定场景下的用户偏好。用户明确要求记住，或对话中出现明确且值得保留的信息时，可以使用本工具。
+
+保存的信息会按相关性被检索或提供给后续对话，不保证每次出现。需要每次对话自动提供的常驻画像信息，请使用 memory_profile_update，并遵守其授权要求。
+
+每次用一句完整、可独立理解的话记录一个事实，保留必要的项目、时间和适用范围。不要把推测当成事实，不记录秘密、凭据、临时任务状态或仅本次有效的要求。
+
+根据内容和适用范围选择工具；“记住”一词本身不决定使用哪个工具。同一信息默认只写入一处。`,
       parameters: {
         content: { type: 'string', required: true, description: 'The fact to remember, stated as one self-contained sentence.' },
         category: { type: 'string', enum: ['preference', 'decision', 'correction', 'fact'] as const },
