@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.89 - Unreleased
+
+- Accept coherent DSH 0.1.7 hosts from rc.1 through the stable 0.1.7 release, including rc.2, without pinning every internal DSH package to one prerelease.
+- Keep runtime checks for mixed DSH packages and incompatible Cordis or Schemastery versions; test rc.2 in the compatibility matrix.
+
 ## 0.2.87 - Unreleased
 
 - Let the agent record durable long-term memories through `memory_remember`: each recording is written into a new isolated `agent_events` pool (schema v12) that mirrors the Event model, gets a synthetic `agent-memory:` provenance block, and projects into the Knowledge Graph.

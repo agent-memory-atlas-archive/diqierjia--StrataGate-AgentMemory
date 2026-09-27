@@ -187,7 +187,7 @@ config:
 
 ## 兼容性与权限
 
-发布门禁会在 Node `24`、Linux 和 Windows 上测试完整的 DSH `0.1.2-rc.1` 依赖族，以及 `@deepseek-ai/dsh@0.1.5-rc.1`、`@deepseek-ai/dsh@0.1.6-alpha.1` 和 `@deepseek-ai/dsh@0.1.7-rc.1`。0.1.5 CLI 的真实依赖树会把内部 DSH 包解析为 `0.1.5-rc.2`；0.1.6 和 0.1.7 CLI 的受测内部 DSH 与 Session Format 包分别解析为对应版本。0.1.7 宿主还提供 Cordis `4.0.4` 和 Schemastery `3.18.4`。插件将这些包声明为可选且精确版本的 peer，由宿主提供一套一致的运行时，避免 npm 在插件目录再安装第二套核心包；不会笼统承诺其他 `0.1.x` 版本。
+发布门禁会在 Node `24`、Linux 和 Windows 上测试完整的 DSH `0.1.2-rc.1` 依赖族，以及 `@deepseek-ai/dsh@0.1.5-rc.1`、`@deepseek-ai/dsh@0.1.6-alpha.1`、`@deepseek-ai/dsh@0.1.7-rc.1` 和 `@deepseek-ai/dsh@0.1.7-rc.2`。0.1.5 CLI 的真实依赖树会把内部 DSH 包解析为 `0.1.5-rc.2`；0.1.6 和 0.1.7 CLI 的受测内部 DSH 与 Session Format 包分别解析为对应版本。0.1.7 宿主还提供 Cordis `4.0.4` 和 Schemastery `3.18.4`。插件将 DSH `0.1.7` 内部包的可选 peer 范围放宽到 `>=0.1.7-rc.1 <0.1.8-0`，启动时仍要求它们全部来自同一版本，并限制 Cordis 与 Schemastery 在已知的小版本补丁范围内。未来 `0.1.7` 更新可直接安装，但发布门禁只覆盖上面列出的版本；更新后仍应运行兼容性检查。不包含 `0.1.8`。
 
 DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于 DSH `0.1.5` 至 `0.1.7`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
 

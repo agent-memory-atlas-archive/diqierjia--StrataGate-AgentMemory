@@ -213,8 +213,9 @@ try {
     const overrides = Object.fromEntries([...new Set([...Object.keys(hostManifest.dependencies ?? {}), ...localInternalNames, ...legacyTransitiveNames])]
       .filter(name => name.startsWith('@deepseek-ai/dsh-'))
       .map(name => [name, internalVersion]))
-    overrides['@deepseek-ai/cordis'] = version === '0.1.7-rc.1' ? '4.0.4' : '4.0.2'
-    overrides['@deepseek-ai/schemastery'] = version === '0.1.7-rc.1' ? '3.18.4' : '3.18.2'
+    const dsh07 = version === '0.1.7' || version.startsWith('0.1.7-')
+    overrides['@deepseek-ai/cordis'] = dsh07 ? '4.0.4' : '4.0.2'
+    overrides['@deepseek-ai/schemastery'] = dsh07 ? '3.18.4' : '3.18.2'
     const freshManifestPath = join(root, 'package.json')
     const freshManifest = JSON.parse(readFileSync(freshManifestPath, 'utf8'))
     freshManifest.overrides = overrides
@@ -277,7 +278,7 @@ try {
     const config = run(process.execPath, [cli, '--profile', 'web', '--dump-config'], root, dshEnv)
     assert(config.includes("sessionRoot: !!js dshHomePath('sessions')"), `${version}: sessionRoot was not wired to the host DSH_HOME`)
     await smokeWeb(cli, root, dshEnv, version)
-    if (version === '0.1.6-alpha.1' || version === '0.1.7-rc.1') {
+    if (version === '0.1.6-alpha.1' || dsh07) {
       await verifyPluginFailureIsDetected(cli, root, dshEnv, version, profile)
     }
     const projectId = process.platform === 'win32' ? '--C-redacted-workspace--' : '--redacted-workspace--'

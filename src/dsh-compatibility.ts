@@ -77,10 +77,25 @@ const SUPPORTED_RUNTIME_FAMILIES = [
       '@deepseek-ai/schemastery': '3.18.4',
     },
   },
+  {
+    cli: '0.1.7-rc.2',
+    versions: {
+      '@deepseek-ai/cordis': '4.0.4',
+      '@deepseek-ai/dsh-agent-default-model': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-client-ui-conversation': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-llm': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-native-command': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-session': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-settings': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-system-prompt': '0.1.7-rc.2',
+      '@deepseek-ai/dsh-tools': '0.1.7-rc.2',
+      '@deepseek-ai/schemastery': '3.18.4',
+    },
+  },
 ] as const
 
 export interface DshRuntimeCompatibility {
-  cliVersion: '0.1.2-rc.1' | '0.1.5-rc.1' | '0.1.6-alpha.1' | '0.1.7-rc.1'
+  cliVersion: string
   packageVersions: Readonly<Record<string, string>>
 }
 
@@ -92,7 +107,7 @@ export function buildDshMessageSource(
   version: string,
   form?: 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay' | 'recall',
 ): any {
-  const source = version === '0.1.7-rc.1'
+  const source = /^0\.1\.7(?:-|$)/.test(version)
     ? { kind: STRATAGATE_MESSAGE_SOURCE_KIND }
     : { kind: 'plugin', plugin: 'stratagate-memory' }
   return form ? { ...source, form } : source
@@ -130,6 +145,14 @@ export function isStrataGateMessageSource(source: unknown): boolean {
     || (value.kind === 'plugin' && value.plugin === 'stratagate-memory')
 }
 
+function isCompatiblePatch(version: string, major: number, minor: number, minimumPatch: number): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version)
+  return !!match
+    && Number(match[1]) === major
+    && Number(match[2]) === minor
+    && Number(match[3]) >= minimumPatch
+}
+
 /**
  * Fail before registering services when a profile-local peer tree shadows the
  * DSH installation. A mixed tree otherwise fails later as an empty conversation
@@ -141,14 +164,26 @@ export function classifyDshRuntime(packageVersions: DshRuntimePackageVersions): 
   ))
   if (family) return { cliVersion: family.cli, packageVersions }
 
+  const dshVersion = packageVersions['@deepseek-ai/dsh-session']
+  const sameDshFamily = RUNTIME_PACKAGES
+    .filter((name) => name.startsWith('@deepseek-ai/dsh-'))
+    .every((name) => packageVersions[name] === dshVersion)
+  if ((/^0\.1\.7-rc\.[1-9]\d*$/.test(dshVersion) || dshVersion === '0.1.7')
+    && sameDshFamily
+    && isCompatiblePatch(packageVersions['@deepseek-ai/cordis'], 4, 0, 4)
+    && isCompatiblePatch(packageVersions['@deepseek-ai/schemastery'], 3, 18, 4)) {
+    return { cliVersion: dshVersion, packageVersions }
+  }
+
   const found = RUNTIME_PACKAGES.map((name) => `${name}@${packageVersions[name]}`).join(', ')
   throw new Error(
     'StrataGate cannot start because this DSH profile resolves an unsupported or mixed core runtime. '
-    + `Resolved: ${found}. Supported tested hosts are @deepseek-ai/dsh@0.1.2-rc.1 `
+    + `Resolved: ${found}. Supported hosts are @deepseek-ai/dsh@0.1.2-rc.1 `
     + '(internal DSH packages 0.1.2-rc.1) and @deepseek-ai/dsh@0.1.5-rc.1 '
     + '(its real dependency tree uses internal DSH packages 0.1.5-rc.2), and '
     + '@deepseek-ai/dsh@0.1.6-alpha.1 (internal DSH packages 0.1.6-alpha.1), and '
-    + '@deepseek-ai/dsh@0.1.7-rc.1 (internal DSH packages 0.1.7-rc.1). '
+    + 'the coherent DSH 0.1.7 family from rc.1 through the 0.1.7 release '
+    + '(Cordis 4.0.x from 4.0.4, Schemastery 3.18.x from 3.18.4). '
     + 'Reinstall or update stratagate-dsh through `dsh plugin --profile <name> add <package>` so the host supplies its peers.',
   )
 }
