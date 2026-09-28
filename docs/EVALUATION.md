@@ -177,3 +177,13 @@ It does not yet support these broader claims:
 - a causal benefit from element cards without disabled/forced/fixed-state ablations.
 
 The next credible milestone is a fixed-state component ablation, followed by the same frozen end-to-end protocol across more conversations and then the full dataset.
+
+## Follow-up validation plan
+
+The following are proposed experiments, not completed results:
+
+1. Hold the model and memory state fixed and ablate short-term display decay and individual retrieval mechanisms. Compare answer accuracy, historical context size, background model input, and total call costs separately.
+2. Give the answering model known-correct source evidence directly. This separates failures to retrieve evidence from reasoning failures that remain when evidence is available.
+3. Repeat the frozen protocol across additional conversations before reporting a full LoCoMo result.
+
+These experiments would help distinguish the contribution of each component from improvements observed between versions that changed multiple components together.
