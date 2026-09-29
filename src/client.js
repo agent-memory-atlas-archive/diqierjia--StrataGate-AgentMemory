@@ -342,6 +342,11 @@ window.__ModuleLoader__.load({
       .sg-support-ai-notice{position:sticky;top:8px;z-index:8;display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:start;gap:10px;margin:12px 0;padding:13px 14px;border:1px solid color-mix(in srgb,var(--sg-good) 45%,var(--sg-border));border-radius:8px;background:color-mix(in srgb,var(--sg-good-soft) 92%,var(--sg-surface));color:var(--sg-text);box-shadow:0 8px 24px rgba(0,0,0,.16);scroll-margin-top:8px}.sg-support-ai-notice-mark{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--sg-good);color:#fff;font-weight:800}.sg-support-ai-notice strong{display:block;color:var(--sg-good);font-size:13px}.sg-support-ai-notice p{margin:4px 0 0;color:var(--sg-text);font-size:12px;line-height:1.5}.sg-support-ai-notice .sg-quiet-button{margin-top:9px}.sg-support-ai-notice-close{display:grid;place-items:center;width:26px;height:26px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--sg-muted);font-size:20px;line-height:1;cursor:pointer}.sg-support-ai-notice-close:hover{background:var(--sg-soft);color:var(--sg-text)}
       @media (max-width:560px){.sg-decay-head{align-items:flex-start;flex-direction:column}.sg-conversation{width:100%;justify-content:flex-start}.sg-conversation select{max-width:100%;flex:1}}
       @media (prefers-reduced-motion:reduce){.sg-memory *,.sg-memory *:before,.sg-memory *:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}.sg-processing-icon,.sg-memory-alert-mark{animation:none}.sg-skeleton:after{display:none}}
+      .sg-tabs{grid-template-columns:repeat(4,1fr)}
+      .sg-profile-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.sg-profile-sync{color:var(--sg-muted);font-size:11px;white-space:nowrap}.sg-profile-sync:before{content:'●';margin-right:5px;color:var(--sg-good)}.sg-profile-sync.pending:before{color:var(--sg-accent)}.sg-profile-sync.failed:before{color:var(--sg-danger)}
+      .sg-profile-group{margin-top:19px;padding:14px 16px 3px;border:1px solid var(--sg-border);border-radius:10px;background:color-mix(in srgb,var(--sg-surface) 62%,transparent)}.sg-profile-group h3{margin:0 0 4px;font-size:14px}.sg-profile-row{border-bottom:1px solid var(--sg-border)}.sg-profile-row:last-child{border-bottom:0}.sg-profile-summary{display:grid;grid-template-columns:minmax(170px,1fr) minmax(0,2fr) auto;align-items:center;gap:14px;min-height:51px}.sg-profile-label{font-size:13px;font-weight:650}.sg-profile-value{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--sg-muted);font-size:13px}.sg-profile-value.empty{opacity:.66}.sg-profile-action{padding:5px 8px;border:0;border-radius:6px;background:transparent;color:var(--sg-accent)!important;cursor:pointer;font-size:12px!important}.sg-profile-action:hover{background:var(--sg-accent-soft)}.sg-profile-editor{padding:0 0 14px}.sg-profile-editor :is(input,textarea){width:100%;padding:9px 10px;border:1px solid var(--sg-border);border-radius:7px;background:var(--sg-surface);color:var(--sg-text);outline:0}.sg-profile-editor textarea{min-height:104px;resize:vertical;font:inherit}.sg-profile-editor :is(input,textarea):focus{border-color:var(--sg-accent);box-shadow:0 0 0 3px var(--sg-focus)}.sg-profile-editor-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:7px}.sg-profile-count{color:var(--sg-muted);font-size:11px}.sg-profile-actions{display:flex;align-items:center;gap:6px}.sg-profile-actions .sg-save-button{margin-top:0}.sg-profile-conflict{margin:8px 0 0;color:var(--sg-warn);font-size:12px}.sg-profile-error{margin:8px 0 0;color:var(--sg-danger);font-size:12px}
+      .sg-profile-action:disabled{opacity:.45;cursor:default}.sg-profile-action:disabled:hover{background:transparent}
+      @media(max-width:560px){.sg-profile-summary{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px}.sg-profile-group{padding:11px 12px 2px}.sg-profile-label,.sg-profile-value{font-size:12px}}
       ${eventDetailCss}
     `
 
@@ -487,13 +492,14 @@ window.__ModuleLoader__.load({
     function selectMemoryCitations(owner) {
       const data = owner.turn.data.get(MEMORY_CITATIONS_KIND)
       const entries = Array.isArray(data?.entries) ? data.entries : []
+      const cutoffSeq = Number.isSafeInteger(owner.turn.end?.seq) ? owner.turn.end.seq : owner.seq
       const selected = []
       const seen = new Set()
       const retrievalGroups = []
       const seenGroups = new Set()
       let retrievedCount = 0
       for (const entry of entries) {
-        if (entry.seq > owner.seq || !Array.isArray(entry.citations)) continue
+        if (entry.seq > cutoffSeq || !Array.isArray(entry.citations)) continue
         const groupCount = Number.isInteger(entry.retrievedCount) && entry.retrievedCount >= 0 ? entry.retrievedCount : entry.citations.length
         const groupKey = String(entry.batchId || 'legacy:' + entry.seq)
         if (!seenGroups.has(groupKey)) {
@@ -529,8 +535,12 @@ window.__ModuleLoader__.load({
 
     function parseToolResultJson(event) {
       if (event.type !== 'tool/result') return null
-      const result = event.data?.message?.content?.[0]
-      if (!result || result.isError === true || !Array.isArray(result.content)) return null
+      const message = event.data?.message
+      if (!message || message.isError === true || !Array.isArray(message.content)) return null
+      // Current DSH stores tool text directly; older sessions wrap it in tool_result.
+      const first = message.content[0]
+      const result = first?.type === 'tool_result' ? first : message
+      if (result.isError === true || !Array.isArray(result.content)) return null
       const text = result.content.find((block) => block?.type === 'text' && typeof block.text === 'string')?.text
       if (!text) return null
       try {
@@ -781,6 +791,7 @@ window.__ModuleLoader__.load({
     }
 
     const shortTermMemoryFeeds = new Map()
+    const SHORT_TERM_POLL_WINDOW_MS = 120_000
 
     function shortTermLayerName(level) {
       return ['索引', '摘要', '关键事实', '精简对话', '近原文', '原文'][Number(level)] || '会话视图'
@@ -801,6 +812,8 @@ window.__ModuleLoader__.load({
         queuedWorkspacePath: '',
         queuedSignal: '',
         pollTimer: null,
+        pollSignal: '',
+        pollUntil: 0,
       }
       shortTermMemoryFeeds.set(sessionId, feed)
       return feed
@@ -859,13 +872,25 @@ window.__ModuleLoader__.load({
         && settingsSnapshot?.value?.showRetrievalStatus !== false
     }
 
-    function shortTermNeedsPolling(payload) {
-      return shortTermBlocks(payload?.data).some((block) => block.processingStatus === 'pending'
-        && block.summaryJob?.status !== 'failed')
+    function shortTermNeedsPolling(payload, signal) {
+      const data = payload?.data
+      const blocks = shortTermBlocks(data)
+      if (blocks.some((block) => block.processingStatus === 'pending'
+        && (block.summaryJob?.status !== 'failed' || block.summaryJob?.nextRetryAt))) return true
+      const match = /^(\d+):idle$/.exec(signal)
+      if (!match || !data) return false
+      const turn = Number(match[1])
+      if (blocks.some((block) => Number(block.turnRange?.[1]) === turn)) return false
+      const open = data.openBlock
+      const capacity = Number(open?.capacity || data.blockTurnSize || 6)
+      const count = Number(open?.turns || 0)
+      const lastTurn = Number(open?.turnRange?.[1])
+      return capacity > 0 && ((lastTurn === turn - 1 && count === capacity - 1)
+        || (lastTurn === turn && count >= capacity))
     }
 
     function scheduleShortTermPoll(feed) {
-      if (feed.pollTimer !== null || feed.listeners.size === 0) return
+      if (feed.pollTimer !== null || feed.listeners.size === 0 || Date.now() >= feed.pollUntil) return
       feed.pollTimer = window.setTimeout(() => {
         feed.pollTimer = null
         void refreshShortTermFeed(feed, feed.workspacePath, feed.signal, true)
@@ -888,10 +913,20 @@ window.__ModuleLoader__.load({
       }
       const workspaceChanged = feed.workspacePath !== workspacePath
       if (!force && !workspaceChanged && feed.signal === signal && feed.snapshot.payload) return feed.request || Promise.resolve()
+      if (feed.pollSignal !== signal || workspaceChanged) {
+        feed.pollSignal = signal
+        feed.pollUntil = Date.now() + SHORT_TERM_POLL_WINDOW_MS
+      }
       if (feed.request) {
-        feed.queuedWorkspacePath = workspacePath
-        feed.queuedSignal = signal
+        if (workspaceChanged || feed.signal !== signal) {
+          feed.queuedWorkspacePath = workspacePath
+          feed.queuedSignal = signal
+        }
         return feed.request
+      }
+      if (feed.pollTimer !== null) {
+        window.clearTimeout(feed.pollTimer)
+        feed.pollTimer = null
       }
       if (workspaceChanged) {
         feed.workspacePath = workspacePath
@@ -912,7 +947,7 @@ window.__ModuleLoader__.load({
       }).then((data) => {
         const payload = data?.activeThreadId === feed.sessionId ? { namespace: feed.namespace, data } : null
         publishShortTermFeed(feed, { payload, loading: false, error: '' })
-        if (shortTermNeedsPolling(feed.snapshot.payload)) scheduleShortTermPoll(feed)
+        if (shortTermNeedsPolling(feed.snapshot.payload, feed.signal)) scheduleShortTermPoll(feed)
       }).catch((reason) => {
         if (reason?.name !== 'AbortError') publishShortTermFeed(feed, { loading: false, error: String(reason?.message || reason) })
       }).finally(() => {
@@ -961,6 +996,8 @@ window.__ModuleLoader__.load({
             }
             feed.controller?.abort()
             feed.controller = null
+            feed.queuedWorkspacePath = ''
+            feed.queuedSignal = ''
           }
         }
       }, [feed])
@@ -1087,7 +1124,9 @@ window.__ModuleLoader__.load({
         h('div', { className: 'sg-retrieved-final' }, h('span', null, '最终采用 ' + citations.length + ' 条'), h('span', null, '检索命中不会自动强化记忆')))
     }
 
-    function MemoryCitationTail({ matched, sessionId, useSession, useSessions, useWorkspaces, usePluginSettings, onOpenGraphNode }) {
+    function MemoryCitationTail({ matched, turn, seq, sessionId, useSession, useSessions, useWorkspaces, usePluginSettings, onOpenGraphNode }) {
+      // DSH 0.1.7 renders this list slot with owner props; older chain slots supply matched.
+      matched = matched || selectMemoryCitations({ turn, seq })
       const citations = matched.citations
       const retrievedCount = matched.retrievedCount
       const retrievalGroups = matched.retrievalGroups
@@ -1373,10 +1412,12 @@ window.__ModuleLoader__.load({
 
     function graphMigrationState(overview, status) {
       const migration = overview?.graphMigration || {}
-      if (migration.state) return migration.state
-      if (migration.complete) return 'complete'
       if (status.graphProjection.processing > 0) return 'processing'
       if (status.graphProjection.terminalFailed > 0) return 'failed'
+      const total = Number(migration.total ?? overview?.events)
+      if (Number.isFinite(total) && total === 0) return 'empty'
+      if (migration.state) return migration.state
+      if (migration.complete) return 'complete'
       return 'incomplete'
     }
 
@@ -3247,19 +3288,126 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null, h(BackBar, { label: backLabel, onBack }), h('div', { className: 'sg-intro' }, h('h2', null, '原始数据'), h('p', null, '供排查问题使用的内部字段与 JSON')), groups.map(([label, value, total]) => h('details', { key: label, className: 'sg-raw-group' }, h('summary', null, label + ' (' + (Array.isArray(value) && Number(total) > value.length ? '已加载 ' + value.length + ' / 共 ' + total : Array.isArray(value) ? value.length : ((value.nodes?.length || 0) + (value.edges?.length || 0))) + ')'), h('pre', { className: 'sg-raw-json sg-code' }, JSON.stringify(value, null, 2)))))
     }
 
+    const profileGroups = [
+      ['身份与语言', [['userPreferredName', 'StrataGate对你的称呼', 100], ['assistantPreferredName', 'StrataGate的名字', 100], ['preferredLanguage', '默认回答语言', 100], ['reasoningLanguage', '思考过程语言', 100]]],
+      ['交互偏好', [['responsePreferences', '回复方式和风格偏好', 1000], ['standingInstructions', '长期持续生效的要求', 1000]]],
+      ['关于用户', [['userBackground', '稳定的用户背景', 1500], ['longTermGoals', '长期目标', 1000]]],
+      ['其他', [['persistentNotes', '其他必须常驻的信息', 1200]]],
+    ]
+    const profileFieldNames = profileGroups.flatMap(([, fields]) => fields.map(([field]) => field))
+    function sameProfile(left, right) {
+      return profileFieldNames.every((field) => left?.[field] === right?.[field] && left?._revisions?.[field] === right?._revisions?.[field])
+    }
+
+    function ProfilePage() {
+      const [profile, setProfile] = React.useState(null)
+      const [editing, setEditing] = React.useState(null)
+      const [saving, setSaving] = React.useState(false)
+      const [syncStatus, setSyncStatus] = React.useState('同步中…')
+      const [error, setError] = React.useState('')
+      const [conflict, setConflict] = React.useState(false)
+      const requestVersion = React.useRef(0)
+      const refreshRef = React.useRef(null)
+      React.useEffect(() => {
+        let active = true
+        let timer = null
+        let controller = null
+        const stopRequest = () => { if (controller) controller.abort(); controller = null }
+        const check = () => {
+          if (!active || document.hidden) return
+          if (timer !== null) window.clearTimeout(timer)
+          timer = null
+          const version = ++requestVersion.current
+          const requestController = new AbortController()
+          controller = requestController
+          void api('profile', {}, { method: 'GET', signal: requestController.signal }).then((latest) => {
+            if (!active || document.hidden || version !== requestVersion.current) return
+            setProfile((current) => sameProfile(current, latest) ? current : latest)
+            setSyncStatus('已同步')
+            setError('')
+          }).catch((reason) => {
+            if (active && version === requestVersion.current && reason?.name !== 'AbortError') { setSyncStatus('同步失败'); setError(String(reason?.message || reason)) }
+          }).finally(() => {
+            if (controller === requestController) controller = null
+            if (active && !document.hidden && version === requestVersion.current) timer = window.setTimeout(check, 5000)
+          })
+        }
+        refreshRef.current = check
+        const onVisibilityChange = () => {
+          if (timer !== null) window.clearTimeout(timer)
+          timer = null
+          if (document.hidden) { ++requestVersion.current; stopRequest() }
+          else check()
+        }
+        document.addEventListener('visibilitychange', onVisibilityChange)
+        check()
+        return () => { active = false; ++requestVersion.current; refreshRef.current = null; if (timer !== null) window.clearTimeout(timer); stopRequest(); document.removeEventListener('visibilitychange', onVisibilityChange) }
+      }, [])
+      const beginEdit = (field) => { setEditing({ field, draft: profile[field] || '', baseValue: profile[field] || '', baseRevision: profile._revisions?.[field] || 0 }); setConflict(false); setError('') }
+      const reloadField = () => {
+        ++requestVersion.current
+        void api('profile', {}, { method: 'GET' }).then((latest) => {
+          setProfile((current) => sameProfile(current, latest) ? current : latest)
+          setEditing((current) => current ? { ...current, draft: latest[current.field] || '', baseValue: latest[current.field] || '', baseRevision: latest._revisions?.[current.field] || 0 } : null)
+          setConflict(false)
+          setError('')
+        }).catch((reason) => setError(String(reason?.message || reason)))
+          .finally(() => refreshRef.current?.())
+      }
+      const save = () => {
+        if (!editing || saving) return
+        if (conflict || profile[editing.field] !== editing.baseValue || profile._revisions?.[editing.field] !== editing.baseRevision) { setConflict(true); return }
+        setSaving(true)
+        setError('')
+        ++requestVersion.current
+        void api('profile', {}, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ field: editing.field, value: editing.draft, expectedValue: editing.baseValue, expectedRevision: editing.baseRevision }) })
+          .then((result) => { setProfile((current) => sameProfile(current, result.snapshot) ? current : result.snapshot); setEditing(null); setConflict(false) })
+          .catch((reason) => { if (String(reason?.message || reason).includes('刚刚在其他位置更新')) setConflict(true); else setError(String(reason?.message || reason)) })
+          .finally(() => { setSaving(false); refreshRef.current?.() })
+      }
+      const total = profile ? profileFieldNames.reduce((sum, field) => sum + Array.from(profile[field] || '').length, 0) : 0
+      return h(React.Fragment, null,
+        h('div', { className: 'sg-profile-head' }, h('div', { className: 'sg-intro' }, h('h2', null, '常驻用户画像'), h('p', null, '跨会话、跨项目持续生效，每轮自动进入上下文')), h('span', { className: 'sg-profile-sync ' + (syncStatus === '同步失败' ? 'failed' : syncStatus === '同步中…' ? 'pending' : ''), role: 'status' }, syncStatus)),
+        error ? h('p', { className: 'sg-profile-error', role: 'alert' }, error) : null,
+        profile ? h(React.Fragment, null,
+          h('p', { className: 'sg-settings-group-copy' }, '总字符 ' + total + ' / 6000'),
+          profileGroups.map(([title, fields]) => h('section', { key: title, className: 'sg-profile-group', 'aria-label': title },
+            h('h3', null, title),
+            fields.map(([field, label, maximum]) => {
+              const value = profile[field] || ''
+              const isEditing = editing?.field === field
+              const changedElsewhere = isEditing && (value !== editing.baseValue || profile._revisions?.[field] !== editing.baseRevision)
+              const draftLength = isEditing ? Array.from(editing.draft).length : 0
+              const nextTotal = total - Array.from(value).length + draftLength
+              return h('div', { key: field, className: 'sg-profile-row' },
+                h('div', { className: 'sg-profile-summary' }, h('span', { className: 'sg-profile-label' }, label), h('span', { className: 'sg-profile-value ' + (value ? '' : 'empty'), title: value || undefined }, value || '未设置'), h('button', { type: 'button', className: 'sg-profile-action', onClick: () => beginEdit(field), disabled: saving || Boolean(editing) }, value ? '编辑' : '添加')),
+                isEditing ? h('div', { className: 'sg-profile-editor' },
+                  field === 'userPreferredName' || field === 'assistantPreferredName' || field === 'preferredLanguage' || field === 'reasoningLanguage'
+                    ? h('input', { id: 'sg-profile-' + field, 'aria-label': label, value: editing.draft, onChange: (event) => setEditing((current) => ({ ...current, draft: event.target.value })) })
+                    : h('textarea', { id: 'sg-profile-' + field, 'aria-label': label, value: editing.draft, onChange: (event) => setEditing((current) => ({ ...current, draft: event.target.value })) }),
+                  changedElsewhere || conflict ? h('p', { className: 'sg-profile-conflict', role: 'alert' }, '该项刚刚在其他位置更新。', h('button', { type: 'button', className: 'sg-profile-action', onClick: reloadField }, '载入最新内容')) : null,
+                  h('div', { className: 'sg-profile-editor-foot' }, h('span', { className: 'sg-profile-count' }, draftLength + ' / ' + maximum), h('div', { className: 'sg-profile-actions' }, h('button', { type: 'button', className: 'sg-quiet-button', disabled: saving, onClick: () => { setEditing(null); setConflict(false); setError('') } }, '取消'), h('button', { type: 'button', className: 'sg-save-button', disabled: saving || draftLength > maximum || nextTotal > 6000 || editing.draft === editing.baseValue || changedElsewhere || conflict, onClick: save }, saving ? '保存中…' : '保存')))) : null)
+            })))) : h('p', null, '正在读取常驻画像…'))
+    }
+
     function SettingsPage({ selected, namespace, dataDirectory, onBack, setView, updateSettings, savingSettings, usePluginSettings, setEffort, resetEffort }) {
       const [turnSize, setTurnSize] = React.useState(String(selected.blockTurnSize ?? 6))
       const [lambda, setLambda] = React.useState(String(selected.blockDecayLambda ?? 0.3))
+      const [agentWeight, setAgentWeight] = React.useState(String(selected.agentMemoryRetrievalWeight ?? 1))
       const [directoryOpening, setDirectoryOpening] = React.useState(false)
       const [directoryFeedback, setDirectoryFeedback] = React.useState({ kind: '', text: '' })
       React.useEffect(() => {
         setTurnSize(String(selected.blockTurnSize ?? 6))
         setLambda(String(selected.blockDecayLambda ?? 0.3))
-      }, [selected.blockTurnSize, selected.blockDecayLambda])
+        setAgentWeight(String(selected.agentMemoryRetrievalWeight ?? 1))
+      }, [selected.blockTurnSize, selected.blockDecayLambda, selected.agentMemoryRetrievalWeight])
       const turnSizeValue = Number(turnSize)
       const lambdaValue = Number(lambda)
+      const agentWeightValue = Number(agentWeight)
       const valid = Number.isSafeInteger(turnSizeValue) && turnSizeValue >= 1 && lambda !== '' && Number.isFinite(lambdaValue) && lambdaValue >= 0
-      const changed = valid && (turnSizeValue !== selected.blockTurnSize || lambdaValue !== selected.blockDecayLambda)
+        && agentWeight !== '' && Number.isFinite(agentWeightValue) && agentWeightValue >= 0 && agentWeightValue <= 5
+      const changed = valid && (turnSizeValue !== selected.blockTurnSize || lambdaValue !== selected.blockDecayLambda
+        || agentWeightValue !== (selected.agentMemoryRetrievalWeight ?? 1))
       const suggestedLambda = Math.round(((selected.blockDecayLambda ?? 0.3) * turnSizeValue / (selected.blockTurnSize || 6)) / 0.05) * 0.05
       const showSuggestion = Number.isSafeInteger(turnSizeValue) && turnSizeValue >= 1 && turnSizeValue !== selected.blockTurnSize
       const pluginSettings = usePluginSettings ? usePluginSettings((state) => state) : null
@@ -3311,8 +3459,10 @@ window.__ModuleLoader__.load({
             h('div', { className: 'sg-stage' }, h('span', null, 'Block 衰减系数 λ'), h('span', { className: 'sg-lambda-control' }, h('input', { className: 'sg-number-input', type: 'number', min: '0', step: '0.05', value: lambda, onChange: (event) => setLambda(event.target.value), 'aria-label': 'Block 衰减系数 λ' }))),
             h('p', { className: 'sg-setting-note' }, '默认 0.3；数字越小，记忆遗忘越慢，消耗 token 越多，不建议大于 0.4。'),
             showSuggestion ? h('div', { className: 'sg-setting-suggestion' }, h('span', null, '为保持按对话轮数计算的遗忘速度，建议 λ 调整为 ' + suggestedLambda.toFixed(2) + '。'), h('button', { type: 'button', className: 'sg-quiet-button', onClick: () => setLambda(String(Number(suggestedLambda.toFixed(2)))) }, '采用建议值')) : null,
+            h('div', { className: 'sg-stage' }, h('span', null, '主动记忆检索占比'), h('span', { className: 'sg-lambda-control' }, h('input', { className: 'sg-number-input', type: 'number', min: '0', max: '5', step: '0.05', value: agentWeight, onChange: (event) => setAgentWeight(event.target.value), 'aria-label': '主动记忆检索占比' }))),
+            h('p', { className: 'sg-setting-note' }, 'agent 主动记录与对话派生记忆分别独立排序后按此权重融合：1 为平权，0 为不浮现 agent 记录，更大值提升 agent 记录的排序权重。'),
             rows.map(([label, value]) => h('div', { key: label, className: 'sg-stage' }, h('span', null, label), h('span', { className: label === '内部空间 ID' ? 'sg-stage-value sg-code' : 'sg-stage-value' }, String(value)))),
-            h('button', { type: 'button', className: 'sg-save-button', disabled: !changed || savingSettings, onClick: () => void updateSettings({ blockTurnSize: turnSizeValue, blockDecayLambda: lambdaValue }) }, savingSettings ? '保存中…' : changed ? '保存设置' : '已保存'))),
+            h('button', { type: 'button', className: 'sg-save-button', disabled: !changed || savingSettings, onClick: () => void updateSettings({ blockTurnSize: turnSizeValue, blockDecayLambda: lambdaValue, agentMemoryRetrievalWeight: agentWeightValue }) }, savingSettings ? '保存中…' : changed ? '保存设置' : '已保存'))),
         h('section', { className: 'sg-settings-group', 'aria-labelledby': 'sg-storage-title' },
           h('h3', { id: 'sg-storage-title', className: 'sg-settings-group-title' }, '数据与存储'),
           h('p', { className: 'sg-settings-group-copy' }, '数据目录与原始数据'),
@@ -3550,7 +3700,9 @@ window.__ModuleLoader__.load({
 
       let content = null
       if (loading && !selected) content = h(Loading)
-      else if (!selected) content = h(Empty, { title: '还没有记忆', copy: '完成一些 DSH 对话后，短期记忆和长期记忆会出现在这里。' })
+      else if (view.name === 'settings' && !selected) content = h(SettingsPage, { selected: { blockTurnSize: 6, blockDecayLambda: 0.3, agentMemoryRetrievalWeight: 1, currentTurn: 0, schemaVersion: 12 }, namespace, dataDirectory: overview.dataDirectory, onBack: moreBack, setView, updateSettings, savingSettings, usePluginSettings, setEffort, resetEffort })
+      else if (section === 'profile' && view.name === 'root') content = h(ProfilePage)
+      else if (!selected && section !== 'more') content = h(Empty, { title: '还没有记忆', copy: '完成一些 DSH 对话后，短期记忆和长期记忆会出现在这里。' })
       else if (view.name === 'event') content = h(EventDetail, { event: view.item, project, source, onBack: goBack, backLabel, onNode: openGraphNode })
       else if (view.name === 'status') content = h(ProcessingStatus, { overview: selected, blocks: data.blocks, conversations, namespace, serverVersion: overview.pluginVersion, stage: view.stage, onBack: view.back ? goBack : () => setView({ name: 'root' }), backLabel: view.back?.name === 'settings' ? '高级设置' : '返回', refresh })
       else if (view.name === 'import') content = h(ImportPage, { namespace, onBack: moreBack, refresh })
@@ -3577,7 +3729,7 @@ window.__ModuleLoader__.load({
             h('span', { className: 'sg-header-community' },
               h('a', { className: 'sg-header-star', href: STAR_REPOSITORY_URL, target: '_blank', rel: 'noopener noreferrer' }, '给 StrataGate 点个 🌟'),
               h('a', { className: 'sg-header-contribute', href: STAR_REPOSITORY_URL, target: '_blank', rel: 'noopener noreferrer' }, '参与开发 · Issue / PR →')))),
-        h('nav', { className: 'sg-tabs', 'aria-label': '记忆视图' }, [['short', '短期记忆'], ['long', '长期记忆'], ['more', '更多']].map(([id, label]) => h('button', { key: id, type: 'button', className: 'sg-tab ' + (section === id ? 'active' : ''), 'aria-current': section === id ? 'page' : undefined, onClick: () => goSection(id) }, label))),
+        h('nav', { className: 'sg-tabs', 'aria-label': '记忆视图' }, [['profile', '常驻画像'], ['short', '短期记忆'], ['long', '长期记忆'], ['more', '更多']].map(([id, label]) => h('button', { key: id, type: 'button', className: 'sg-tab ' + (section === id ? 'active' : ''), 'aria-current': section === id ? 'page' : undefined, onClick: () => goSection(id) }, label))),
         error ? h('div', { className: 'sg-error' }, h('div', { className: 'sg-error-title' }, '暂时无法读取完整记忆'), h('div', null, '已显示能够读取的内容，请稍后重新加载。'), h('details', null, h('summary', null, '技术详情'), h('div', { className: 'sg-code' }, error))) : null,
         view.name === 'status' ? null : h(MemoryStatusAlert, { overview: error ? null : selected, onOpen: (stage) => setView({ name: 'status', stage }) }),
         h('section', { key: section + ':' + view.name, className: 'sg-view', 'aria-label': 'StrataGate 记忆内容' }, content),
@@ -3589,20 +3741,14 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       const slots = ctx.get('slots')
       if (!slots) return
+      const configForms = ctx.get('configForms')
       const settingsScope = ctx.get('settingsScope')
-      const pluginSettingsScope = settingsScope ? settingsScope.bind({ namespace: 'stratagate-memory' }) : null
-      const uiConversation = ctx.get('uiConversation')
-      if (uiConversation) {
-        uiConversation.events.register(memoryCitationsDefinition)
-        ensureCitationStyles()
-        slots.inject('conversation.chat.turnTail', () => slots.register({
-          name: 'conversation.chat.turnTail',
-          select: selectMemoryCitations,
-          inject: () => ({
-            ...(pluginSettingsScope ? { hooks: { pluginSettings: pluginSettingsScope } } : {}),
-            onOpenGraphNode: (namespace, nodeId) => navigateToGraphNode(ctx, namespace, nodeId),
-          }),
-        }, MemoryCitationTail))
+      const pluginSettingsScope = configForms
+        ? configForms.get('stratagate-memory')
+        : settingsScope ? settingsScope.bind({ namespace: 'stratagate-memory' }) : null
+      const warnCitationFailure = (part, error) => {
+        if (typeof console === 'undefined' || typeof console.warn !== 'function') return
+        try { console.warn('[StrataGate] ' + part + ' registration failed; memory settings remain available.', error) } catch {}
       }
       slots.inject('settings.section', () => slots.register({
         name: 'settings.section',
@@ -3618,6 +3764,31 @@ window.__ModuleLoader__.load({
           setRetrievalStatus: pluginSettingsScope ? (visible) => pluginSettingsScope.set('showRetrievalStatus', visible) : null,
         }),
       }, (props) => h(MemoryPage, props)))
+      try {
+        const uiConversation = ctx.get('uiConversation')
+        if (uiConversation) {
+          uiConversation.events.register(memoryCitationsDefinition)
+          ensureCitationStyles()
+          slots.inject('conversation.chat.turnTail', () => {
+            try {
+              return slots.register({
+                name: 'conversation.chat.turnTail',
+                id: 'stratagate-memory-citations',
+                select: selectMemoryCitations,
+                inject: () => ({
+                  ...(pluginSettingsScope ? { hooks: { pluginSettings: pluginSettingsScope } } : {}),
+                  onOpenGraphNode: (namespace, nodeId) => navigateToGraphNode(ctx, namespace, nodeId),
+                }),
+              }, MemoryCitationTail)
+            } catch (error) {
+              warnCitationFailure('chat turn tail', error)
+              return () => {}
+            }
+          })
+        }
+      } catch (error) {
+        warnCitationFailure('chat citations', error)
+      }
       if (typeof document !== 'undefined') {
         disposeFeedbackLinkNavigation?.()
         const disposeLinkNavigation = installFeedbackLinkNavigation(ctx)

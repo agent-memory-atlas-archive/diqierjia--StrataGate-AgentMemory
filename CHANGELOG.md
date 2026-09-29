@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.2.89 - Unreleased
+
+- Accept coherent DSH 0.1.7 hosts from rc.1 through the stable 0.1.7 release, including rc.2, without pinning every internal DSH package to one prerelease.
+- Keep runtime checks for mixed DSH packages and incompatible Cordis or Schemastery versions; test rc.2 in the compatibility matrix.
+
+## 0.2.87 - Unreleased
+
+- Let the agent record durable long-term memories through `memory_remember`: each recording is written into a new isolated `agent_events` pool (schema v12) that mirrors the Event model, gets a synthetic `agent-memory:` provenance block, and projects into the Knowledge Graph.
+- Resolve duplicates and conflicts before writing: exact and near duplicates reinforce the existing card, ambiguous overlap gets one synchronous model adjudication reusing the external-memory decision contract (add/merge/supersede/conflict/ignore with a non-destructive low-confidence downgrade), and clear-new facts write without a model call.
+- Merge agent-recorded Events into retrieval through per-pool top-k lanes: the passive and agent pools are ranked independently and fused with weighted RRF, keeping `source: 'agent-recorded'` cards, cross-session persistence, and the `/api/stratagate/agent-memories` view; `agentMemoryRetrievalWeight` tunes the agent lane's share (0–5, default 1) and `agentMemoryEnabled: false` disables and unregisters the feature.
+
+## 0.2.86 - Unreleased
+
+- Register the chat memory tail with a stable list slot ID on DSH `0.1.7-rc.1` and derive its citation data from owner props, while retaining the older chain slot path. This also allows the StrataGate Settings section to finish registering. Chat citation registration now degrades independently with a console warning if the optional host slot fails, keeping Settings available.
+
+## 0.2.85 - Unreleased
+
+- Add explicit support for DSH `0.1.7-rc.1` and its host-provided runtime package family, including Cordis `4.0.4` and Schemastery `3.18.4`.
+- Adapt the in-chat settings controls to DSH's profile-backed config forms while retaining the earlier settings service on supported older hosts. Keep the live reasoning-effort preference effective without restarting the plugin.
+- Validate the legacy citation bridge as a V1 Session generation before DSH continues its V4 migration; preserve the original V0 log and its recovery receipt.
+- Extend the compatibility matrix and clean-install smoke checks to the 0.1.7 host.
+
+## 0.2.84 - 2026-09-25
+
+- Clarify the Block Summarizer's L0-L2 layered memory output, source attribution, uncertainty, and length guidance.
+- Use a high-recall `shouldExtract` pre-screen so plausible long-term Events reach the Event Extractor, and describe L0 tags as topical labels for rapid recognition.
+
+## 0.2.83 - 2026-09-24
+
+- Move Persistent Profile to a compact primary tab with grouped, single-field editing.
+- Keep the visible Profile current with lightweight polling, and reject stale same-field Settings saves without overwriting Agent or maintenance changes.
+- Add an independent visible reasoning language preference alongside the final answer language, with nine fixed Profile fields and no change to the overall budget.
+
+## 0.2.82 - 2026-09-23
+
+- Add a global, eight-field Persistent Profile that enters every model call without retrieval, with one-field Settings and `memory_profile_update` edits.
+- Track Profile changes in SQLite and safely compress existing Profile wording in a bounded background maintenance pass.
+
+## 0.2.81 - 2026-09-23
+
+- Bound Event extraction history to eight relevant and four recently formed Events, excluding forgotten and archived memory while keeping superseded history eligible.
+
+## 0.2.79 - 2026-09-22
+
+- Keep background Block summary, Event extraction, and Graph projection jobs pending without consuming attempts until the selected DSH model adapter is registered, then resume them immediately after adapter updates.
+- Retry a raced `NO_ADAPTER` model call once outside Core's existing three-attempt task budget, while preserving the normal terminal behavior for genuine model failures.
+
+## 0.2.78 - 2026-09-21
+
+- Derive Block summaries and Events from a provenance-preserving compact view of L5 messages, omitting large code and bounding oversized tool payloads while keeping full raw evidence in L5.
+- Preserve message IDs and validate Event `sourceMessageIds` against the original L5 block so tool-trace compaction does not weaken evidence links.
+
+## 0.2.77 - 2026-09-21
+
+- Treat an empty Event store as a normal idle state so a new workspace no longer reports an unfinished 0/0 knowledge graph update.
+
+## 0.2.76 - 2026-09-20
+
+- Track exact Event provenance for Graph node names, aliases, and tags without changing the SQLite schema, while keeping legacy metadata visible only when every potential source remains exposable.
+- Prevent hidden or unproven metadata from driving entity merges, citations, adopted names, search claims, or automatic context, and keep canonical-name evidence attached to the name it actually supports.
+- Preserve Fact key/value record boundaries during temporal search so unrelated fields cannot manufacture a current or historical match, while retaining legitimate multi-record queries.
+
 ## 0.2.75 - 2026-09-20
 
 - Keep feedback reports local until the user explicitly pastes them, with stronger credential redaction, privacy-safe Issue URLs, and reliable clipboard, popup, and draft-save failure handling.

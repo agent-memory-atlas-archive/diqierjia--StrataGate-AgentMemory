@@ -10,7 +10,7 @@ import {
 import { applyElementChanges, elementViewAt } from './elements.js';
 import { normalizeStandardEventType } from './events.js';
 import { externalMemoryJsonExtractor, parseExternalMemoryExport } from './external-memory.js';
-import { applyGraphProjection } from './graph.js';
+import { GRAPH_PROVENANCE_LIMIT, applyGraphProjection, boundEffectiveGraphNodeView, effectiveGraphNodeView, graphTimeline } from './graph.js';
 import { normalizeRetrievalAssessment, type RetrievalAssessment, type RetrievalAssessmentInput } from './retrieval.js';
 import { SqliteStorage } from './sqlite.js';
 import {
@@ -26,6 +26,7 @@ import {
   KNOWLEDGE_GRAPH_PROJECTOR_VERSION,
   DERIVATION_MAX_ATTEMPTS,
   cloneSnapshot,
+  isSyntheticSourceThreadId,
   normalizeSnapshot,
   type ElementProjectionJob,
   type ExtractionJob,
@@ -40,10 +41,15 @@ import {
 } from './storage.js';
 import type {
   AppendTurnResult,
+  AgentEventRecordOptions,
+  AgentEventRecordResult,
+  AgentEventCardInput,
+  AgentMemoryCategory,
   BlockLevel,
   BlockLiftSource,
   BlockSummarizer,
   ElementCard,
+  MemoryCriticality,
   ElementProjectionContext,
   ElementProjectionResult,
   ElementProjector,
@@ -68,6 +74,7 @@ import type {
   ExternalMemoryPreviewDecision,
   ExternalMemoryUndoResult,
   GraphEdge,
+  GraphFact,
   GraphNode,
   GraphNodeSearchResult,
   GraphProjectionContext,
@@ -180,7 +187,7 @@ function defaultGraphIdFactory(prefix: 'node' | 'edge' | 'gfact' | 'gproj'): str
   return `${prefix}_${crypto.randomUUID()}`;
 }
 
-function renderBlock(block: MemoryBlock, level: BlockLevel): string {
+export function renderBlock(block: MemoryBlock, level: BlockLevel): string {
   if (block.processingStatus !== 'ready' || !block.l0Title || !block.l0Tags || !block.l1Summary || !block.l2Keypoints) {
     throw new Error(`Block ${block.id} is not ready for rendering`);
   }
@@ -211,6 +218,65 @@ const EXTERNAL_MEMORY_AUTO_APPLY_CONFIDENCE = 0.85;
 function externalMemoryFingerprint(value: Pick<ExternalMemoryCandidate, 'title' | 'summary'>): string {
   return `${normalizeSearchText(value.title)}\u0000${normalizeSearchText(value.summary)}`;
 }
+const AGENT_EVENT_NEAR_DUPLICATE = 0.85;
+const AGENT_EVENT_AMBIGUOUS = 0.35;
+const AGENT_EVENT_MIN_SHARED_TOKENS = 2;
+/** Cap on real conversation messages cited as agent-event provenance. */
+const AGENT_EVENT_PROVENANCE_LIMIT = 6;
+
+/** Phase-1/2 boundary of the recordAgentEvent gate. */
+type AgentEventGateOutcome =
+  | { phase: 'done'; result: AgentEventRecordResult }
+  | {
+      phase: 'adjudicate';
+      candidate: ExternalMemoryCandidate;
+      matches: ExternalMemoryMatch[];
+      ambiguous: string[];
+      matchedEventIds: string[];
+      now: string;
+    };
+
+/**
+ * Share of the shorter side's unique search tokens contained in the other
+ * side. Fewer than `AGENT_EVENT_MIN_SHARED_TOKENS` shared tokens counts as
+ * zero so short queries never match everything.
+ */
+export function tokenContainment(candidateTokens: readonly string[], existingTokens: readonly string[]): number {
+  const candidate = new Set(candidateTokens);
+  const existing = new Set(existingTokens);
+  if (candidate.size === 0 || existing.size === 0) return 0;
+  const shared = [...candidate].filter((token) => existing.has(token)).length;
+  if (shared < AGENT_EVENT_MIN_SHARED_TOKENS) return 0;
+  return shared / Math.min(candidate.size, existing.size);
+}
+
+const AGENT_MEMORY_TAG = 'agent-recorded';
+
+function agentEventCandidate(
+  content: string,
+  category: AgentMemoryCategory | undefined,
+  now: string,
+  threadId: string | undefined,
+): ExternalMemoryCandidate {
+  const summary = content.replace(/\s+/gu, ' ').trim().slice(0, 2_000);
+  const firstSentence = summary.split(/[。．!！?？;\n]/u).map((part) => part.trim()).find(Boolean);
+  const title = (firstSentence ?? summary).slice(0, 80) || 'Agent memory';
+  return {
+    title,
+    summary,
+    tags: [AGENT_MEMORY_TAG, ...(category ? [`category:${category}`] : [])],
+    scope: 'user',
+    confidence: 1,
+    memoryKind: category === 'preference' ? 'preference' : category === 'decision' ? 'event' : 'fact',
+    ...(category ? { category: category === 'preference' ? 'preference' : 'project' } : {}),
+    temporal: {
+      mentionedAt: now,
+      eventType: category === 'decision' ? 'decision' : category === 'correction' ? 'change' : 'other',
+      ...(threadId ? { threadId } : {}),
+    },
+  };
+}
+
 const DERIVATION_BACKOFF_MS = 1_000;
 
 export class StrataGate {
@@ -228,6 +294,7 @@ export class StrataGate {
   private readonly openTail: RawMessage[] = [];
   private readonly blocks: MemoryBlock[] = [];
   private readonly events: EventCard[] = [];
+  private readonly agentEvents: EventCard[] = [];
   private readonly elements: ElementCard[] = [];
   private readonly graphNodes: GraphNode[] = [];
   private readonly graphEdges: GraphEdge[] = [];
@@ -482,6 +549,20 @@ export class StrataGate {
     return this.events;
   }
 
+  /** Agent-recorded memories (isolated pool; see recordAgentEvent). */
+  listAgentEvents(): readonly EventCard[] {
+    return this.agentEvents;
+  }
+
+  /** Both pools in one read-only view — the merge point for retrieval and graph work. */
+  listAllEvents(): readonly EventCard[] {
+    return [...this.events, ...this.agentEvents];
+  }
+
+  private findEvent(id: string): EventCard | undefined {
+    return this.events.find((event) => event.id === id) ?? this.agentEvents.find((event) => event.id === id);
+  }
+
   listElements(): readonly ElementCard[] {
     return this.elements;
   }
@@ -640,6 +721,7 @@ export class StrataGate {
       blocks: this.blocks,
       summaryJobs: [...this.summaryJobs.values()],
       events: this.events,
+      agentEvents: this.agentEvents,
       graphNodes: this.graphNodes,
       graphEdges: this.graphEdges,
       graphProjectionJobs: [...this.graphProjectionJobs.values()],
@@ -772,7 +854,7 @@ export class StrataGate {
     forceConfirmation = false,
   ): ExternalMemoryPreviewDecision {
     const allowed = new Set(matches.map(({ event }) => event.id));
-    const exact = this.events.find((event) =>
+    const exact = this.listAllEvents().find((event) =>
       event.status !== 'forgotten'
       && event.status !== 'archived'
       && externalMemoryFingerprint(event) === externalMemoryFingerprint(candidate));
@@ -808,7 +890,7 @@ export class StrataGate {
     forceConfirmation = false,
   ): Promise<ExternalMemoryPreviewDecision> {
     const fingerprint = externalMemoryFingerprint(candidate);
-    const exact = this.events.find((event) =>
+    const exact = this.listAllEvents().find((event) =>
       event.status !== 'forgotten'
       && event.status !== 'archived'
       && externalMemoryFingerprint(event) === fingerprint);
@@ -943,7 +1025,7 @@ export class StrataGate {
     if (!candidate) return null;
     const priorFingerprints = new Set(current.candidates.slice(0, index).map(externalMemoryFingerprint));
     const fingerprint = externalMemoryFingerprint(candidate);
-    const exact = this.events.find((event) =>
+    const exact = this.listAllEvents().find((event) =>
       event.status !== 'forgotten'
       && event.status !== 'archived'
       && externalMemoryFingerprint(event) === fingerprint);
@@ -1086,7 +1168,7 @@ export class StrataGate {
           changedEventIds.add(createdEvent.id);
           if (action === 'CONFLICT') {
             for (const id of targets) {
-              const existing = this.events.find((event) => event.id === id);
+              const existing = this.findEvent(id);
               if (!existing) continue;
               existing.temporal.conflictsWithEventIds = [...new Set([...(existing.temporal.conflictsWithEventIds ?? []), createdEvent.id])];
               existing.updatedAt = importedAt;
@@ -1140,7 +1222,9 @@ export class StrataGate {
       const now = toUtc8Iso(this.now());
 
       this.events.splice(0, this.events.length, ...this.events.filter((event) => !importedEventIds.has(event.id)));
-      for (const event of this.events) {
+      // Reference scrubbing spans both pools: an agent-recorded event may link
+      // to (or supersede) an imported event that is being undone here.
+      for (const event of this.listAllEvents()) {
         for (const field of ['conflictsWithEventIds', 'supersedesEventIds', 'beforeEventIds', 'afterEventIds', 'relatedEventIds'] as const) {
           const previous = event.temporal[field] ?? [];
           const filtered = previous.filter((target) => !importedEventIds.has(target));
@@ -1154,7 +1238,7 @@ export class StrataGate {
           restoredEventIds.add(event.id);
         }
         if (event.supersededBy && importedEventIds.has(event.supersededBy)) {
-          const replacement = this.events.find((candidate) =>
+          const replacement = this.listAllEvents().find((candidate) =>
             candidate.id !== event.id && (candidate.temporal.supersedesEventIds ?? []).includes(event.id));
           event.status = replacement ? 'superseded' : 'active';
           event.supersededBy = replacement?.id ?? null;
@@ -1216,12 +1300,54 @@ export class StrataGate {
 
   async searchEvents(query: string, options: SearchOptions = {}): Promise<EventSearchResult[]> {
     const limit = Math.max(1, Math.min(20, options.limit ?? 6));
+    const agentWeight = Math.max(0, options.agentMemoryWeight ?? 1);
+    // Per-pool top-k: each pool produces its own ranking over its own lane so
+    // a large pool cannot crowd the other one out of the result window, then
+    // the two rankings fuse through weighted RRF (the agent pool's share is
+    // the caller-configurable weight; passive events always weigh 1).
+    const rankings: EventCard[][] = [];
+    const weights: number[] = [];
+    const passive = this.rankEventPool(
+      this.events.filter((event) => event.status === 'active' || event.status === 'superseded'),
+      query, options, limit,
+    );
+    if (passive.length > 0) {
+      rankings.push(passive);
+      weights.push(1);
+    }
+    if (agentWeight > 0) {
+      const agent = this.rankEventPool(
+        this.agentEvents.filter((event) => event.status === 'active' || event.status === 'superseded'),
+        query, options, limit,
+      );
+      if (agent.length > 0) {
+        rankings.push(agent);
+        weights.push(agentWeight);
+      }
+    }
+    if (rankings.length === 0) return [];
+    const ranked = rrfRank(rankings, weights).slice(0, limit).map(({ item: event, score }) => ({ event, score }));
+    if (ranked.length > 0 && options.trackRetrieval !== false) {
+      const now = toUtc8Iso(this.now());
+      await this.commitMutation(() => {
+        for (const { event } of ranked) event.weight.lastRetrievedAt = now;
+      });
+    }
+    return ranked;
+  }
+
+  /** Rank one event pool (BM25 + structured filters fused by RRF), sliced to `limit`. */
+  private rankEventPool(
+    candidates: readonly EventCard[],
+    query: string,
+    options: SearchOptions,
+    limit: number,
+  ): EventCard[] {
     const participants = (options.participants ?? []).map(normalizeSearchText).filter(Boolean);
     const eventType = normalizeSearchText(options.eventType ?? '');
     const from = options.happenedFrom ? Date.parse(options.happenedFrom) : Number.NEGATIVE_INFINITY;
     const to = options.happenedTo ? Date.parse(options.happenedTo) : Number.POSITIVE_INFINITY;
     const hasTimeFilter = Boolean(options.happenedFrom || options.happenedTo);
-    const candidates = this.events.filter((event) => event.status === 'active' || event.status === 'superseded');
     const participantMatches = candidates.filter((event) => participants.length > 0 && participants.every((person) =>
       (event.temporal.participants ?? []).some((candidate) => fuzzySearchMatch(candidate, person))));
     const typeMatches = eventType ? candidates.filter((event) =>
@@ -1276,14 +1402,7 @@ export class StrataGate {
       if (searchTokens(query).length > 0) return [];
       rankings.push(structured(candidates));
     }
-    const ranked = rrfRank(rankings).slice(0, limit).map(({ item: event, score }) => ({ event, score }));
-    if (ranked.length > 0 && options.trackRetrieval !== false) {
-      const now = toUtc8Iso(this.now());
-      await this.commitMutation(() => {
-        for (const { event } of ranked) event.weight.lastRetrievedAt = now;
-      });
-    }
-    return ranked;
+    return rrfRank(rankings).slice(0, limit).map(({ item }) => item);
   }
 
   async claimNextElementProjection(): Promise<ElementProjectionContext | null> {
@@ -1294,7 +1413,10 @@ export class StrataGate {
         .sort((left, right) => Number(left.status !== 'pending') - Number(right.status !== 'pending')
           || left.createdAt.localeCompare(right.createdAt))[0];
       if (!job) return null;
-      const events = job.sourceEventIds.flatMap((id) => this.events.find((event) => event.id === id) ?? []);
+      const events = job.sourceEventIds.flatMap((id) => {
+        const event = this.findEvent(id);
+        return event ? [event] : [];
+      });
       if (events.length === 0) {
         throw new Error(`Element projection ${job.id} has no available source events`);
       }
@@ -1319,7 +1441,7 @@ export class StrataGate {
       if (job.status !== 'running') throw new Error(`Element projection ${job.id} is ${job.status}, not running`);
       const touched = applyElementChanges({
         elements: this.elements,
-        events: this.events,
+        events: this.listAllEvents().slice(),
         changes: Array.isArray(result.changes) ? result.changes : [],
         allowedEventIds: new Set(job.sourceEventIds),
         now: toUtc8Iso(this.now()),
@@ -1363,7 +1485,10 @@ export class StrataGate {
         .sort((left, right) => Number(left.status !== 'pending') - Number(right.status !== 'pending')
           || right.priority - left.priority || left.createdAt.localeCompare(right.createdAt))[0];
       if (!job) return null;
-      const events = job.sourceEventIds.flatMap((id) => this.events.find((event) => event.id === id) ?? []);
+      const events = job.sourceEventIds.flatMap((id) => {
+        const event = this.findEvent(id);
+        return event ? [event] : [];
+      });
       if (events.length === 0) throw new Error(`Graph projection ${job.id} has no available source events`);
       job.status = 'running';
       job.attempts += 1;
@@ -1372,17 +1497,24 @@ export class StrataGate {
       const eventText = normalizeSearchText(events.map((event) => [
         event.title, event.summary, event.tags.join(' '), (event.temporal.participants ?? []).join(' '),
       ].join(' ')).join(' '));
-      const relevantNodes = this.graphNodes.filter((node) => [node.name, ...node.aliases]
-        .some((name) => eventText.includes(normalizeSearchText(name))))
-        .concat([...this.graphNodes].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 24));
+      const effectiveViews = this.graphNodes.flatMap((node) => effectiveGraphNodeView(node, this.graphEdges, this.listAllEvents()) ?? []);
+      const effectiveNodes = effectiveViews.map(({ node }) => node);
+      const relevantNodes = effectiveNodes.filter((node) => [node.name, ...node.aliases]
+        .some((name) => name && eventText.includes(normalizeSearchText(name))))
+        .concat([...effectiveNodes].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)).slice(0, 24));
       const existingNodes = [...new Map(relevantNodes.map((node) => [node.id, node])).values()].slice(0, 32);
       const nodeIds = new Set(existingNodes.map(({ id }) => id));
+      const visibleEdgeIds = new Set(effectiveViews.flatMap(({ currentEdges, historicalEdges }) => [
+        ...currentEdges,
+        ...historicalEdges,
+      ]).map(({ id }) => id));
       return {
         jobId: job.id,
         projectorVersion: job.projectorVersion,
         events: structuredClone(events),
         existingNodes: structuredClone(existingNodes),
-        existingEdges: structuredClone(this.graphEdges.filter(({ fromNodeId, toNodeId }) => nodeIds.has(fromNodeId) && nodeIds.has(toNodeId)).slice(-60)),
+        existingEdges: structuredClone(this.graphEdges.filter(({ id, fromNodeId, toNodeId }) => visibleEdgeIds.has(id)
+          && nodeIds.has(fromNodeId) && nodeIds.has(toNodeId)).slice(-60)),
       };
     });
   }
@@ -1399,7 +1531,7 @@ export class StrataGate {
       const touched = applyGraphProjection({
         nodes: this.graphNodes,
         edges: this.graphEdges,
-        events: this.events,
+        events: this.listAllEvents().slice(),
         result,
         allowedEventIds: new Set(job.sourceEventIds),
         now: toUtc8Iso(this.now()),
@@ -1408,11 +1540,13 @@ export class StrataGate {
       job.status = 'completed';
       job.nodeIds = touched.nodeIds;
       job.edgeIds = touched.edgeIds;
-      job.reason = typeof result.reason === 'string' ? result.reason.trim().replace(/\s+/g, ' ').slice(0, 500) || null : null;
+      const normalizedReason = typeof result.reason === 'string' ? result.reason.trim().replace(/\s+/g, ' ') : '';
+      const warning = touched.warnings.length > 0 ? `Validation: ${touched.warnings.join(' ')}` : '';
+      job.reason = [warning, normalizedReason].filter(Boolean).join(' ').slice(0, 500) || null;
       job.lastError = null;
       job.nextRetryAt = null;
       job.updatedAt = toUtc8Iso(this.now());
-      return touched;
+      return { nodeIds: touched.nodeIds, edgeIds: touched.edgeIds };
     });
   }
 
@@ -1636,7 +1770,7 @@ export class StrataGate {
     await this.commitMutation(() => {
       const now = toUtc8Iso(this.now());
       for (const id of requestedEventIds) {
-        const event = this.events.find((candidate) => candidate.id === id);
+        const event = this.findEvent(id);
         if (!event || event.status === 'forgotten' || event.status === 'archived') continue;
         event.weight.mentionCount += 1;
         event.weight.lastAdoptedTurn = this.currentTurn;
@@ -1736,7 +1870,329 @@ export class StrataGate {
     return block;
   }
 
-  private addEventInMemory(input: EventCardInput): EventCard {
+  /** Synthetic provenance block for one agent-recorded fact (see recordAgentEvent). */
+  private createAgentSourceBlock(text: string, recordedAt: string, tags: readonly string[]): MemoryBlock {
+    const blockId = this.idFactory('blk');
+    const threadId = `agent-memory:${blockId}`;
+    const message: RawMessage = {
+      id: this.idFactory('msg'),
+      role: 'user',
+      content: text,
+      createdAt: recordedAt,
+      threadId,
+    };
+    const firstLine = text.split(/\r?\n/u).map((line) => line.trim()).find(Boolean) ?? 'Agent-recorded memory';
+    const block: MemoryBlock = {
+      id: blockId,
+      threadId,
+      sequence: Math.max(0, ...this.blocks.map(({ sequence }) => sequence)) + 1,
+      startTurn: 1,
+      endTurn: 1,
+      createdAt: recordedAt,
+      l0Title: firstLine.slice(0, 80),
+      l0Tags: ['agent-memory', ...tags],
+      l1Summary: text.replace(/\s+/gu, ' ').trim().slice(0, 500),
+      l2Keypoints: text.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean).slice(0, 8),
+      shouldExtract: false,
+      processingStatus: 'ready',
+      ...deterministicBlockLayers([message]),
+      pointerCurrentLevel: 5,
+      pointerAnchorLevel: 5,
+      pointerAnchorBlockPosition: 1,
+      lastLiftedAt: null,
+      lastLiftedBy: null,
+    };
+    this.blocks.push(block);
+    this.indexRawBlock(block);
+    this.markRawMessagesForUpsert(block.l5Raw);
+    return block;
+  }
+
+  /**
+   * Record one agent-authored fact as a long-term Event in the isolated
+   * agent-events pool, after a pre-write duplicate/conflict gate:
+   * exact and near duplicates reinforce the existing card instead of writing;
+   * ambiguous overlap gets one model adjudication reusing the external-memory
+   * decision contract; clear-new facts write directly.
+   *
+   * The gate follows the same claim → model → commit shape as the Block
+   * summarizer/extractor: phase 1 (mutation) runs the deterministic gate,
+   * phase 2 runs the decider WITHOUT holding the mutation queue so concurrent
+   * writes are never blocked, phase 3 (mutation) re-checks duplicates and
+   * applies the decision. Reinforcement is applied inline inside a mutation
+   * (recordMemoryUse would nest commitMutation and deadlock) and the pre-write
+   * search MUST pass trackRetrieval:false for the same reason.
+   */
+  async recordAgentEvent(options: AgentEventRecordOptions): Promise<AgentEventRecordResult> {
+    const content = options.content.trim();
+    if (!content) throw new TypeError('Agent memory content must not be empty');
+    if (options.category !== undefined && !['preference', 'decision', 'correction', 'fact'].includes(options.category)) {
+      throw new TypeError(`Unknown agent memory category: ${String(options.category)}`);
+    }
+    const topK = Math.max(1, Math.min(20, Math.floor(options.topK ?? 5)));
+    const decider = options.decider;
+
+    // Phase 1 (mutation held): deterministic gate. Duplicates reinforce,
+    // clear-new facts write, no-decider ambiguity conflict-marks — none of
+    // these need a model. Only an ambiguous fact WITH an adjudicator defers.
+    const gate = await this.commitMutation(async (): Promise<AgentEventGateOutcome> => {
+      const now = toUtc8Iso(options.importedAt ?? this.now());
+      const candidate = agentEventCandidate(content, options.category, now, options.threadId?.trim() || undefined);
+      const candidateTokens = searchTokens(`${candidate.title} ${candidate.summary}`);
+      const reinforced = this.scanAgentEventDuplicates(candidate, candidateTokens, now);
+      if (reinforced) return { phase: 'done', result: reinforced };
+
+      const query = `${candidate.title} ${candidate.summary}`.trim();
+      const matches = await this.searchEvents(query, { limit: topK, trackRetrieval: false });
+      const matchedEventIds = matches.map(({ event }) => event.id);
+      const ambiguous = matches
+        .filter(({ event }) => tokenContainment(candidateTokens, searchTokens(`${event.title} ${event.summary}`)) >= AGENT_EVENT_AMBIGUOUS)
+        .map(({ event }) => event.id);
+
+      if (ambiguous.length === 0) {
+        return { phase: 'done', result: this.writeAgentEvent(candidate, 'ADDED', 'clear-new', [], { now, matchedEventIds }) };
+      }
+      if (!decider) {
+        return { phase: 'done', result: this.writeAgentEvent(candidate, 'CONFLICT_MARKED', 'heuristic-conflict', ambiguous, {
+          now,
+          matchedEventIds,
+          conflicts: true,
+          reason: '存在语义相关的既有记忆且当前没有可用的仲裁器，已标记冲突',
+        }) };
+      }
+      return { phase: 'adjudicate', candidate, matches, ambiguous, matchedEventIds, now };
+    });
+    if (gate.phase === 'done') return gate.result;
+    // Unreachable: the adjudicate branch requires a decider.
+    if (!decider) throw new Error('StrataGate agent memory adjudicator is missing');
+
+    // Phase 2 (no mutation held): the model call. Concurrent writes in this
+    // namespace proceed while the adjudication is in flight.
+    let decision: ExternalMemoryDecision | undefined;
+    try {
+      decision = await decider({
+        candidate: structuredClone(gate.candidate),
+        matches: structuredClone(gate.matches),
+      });
+    } catch {
+      decision = undefined;
+    }
+
+    // Phase 3 (mutation held): apply with fresh duplicate re-checks — another
+    // write may have landed the same fact while the adjudication ran.
+    return this.commitMutation(() => {
+      const now = toUtc8Iso(this.now());
+      const candidateTokens = searchTokens(`${gate.candidate.title} ${gate.candidate.summary}`);
+      const reinforced = this.scanAgentEventDuplicates(gate.candidate, candidateTokens, now);
+      if (reinforced) return reinforced;
+      if (!decision) {
+        return this.writeAgentEvent(gate.candidate, 'CONFLICT_MARKED', 'decider-error', gate.ambiguous, {
+          now,
+          matchedEventIds: gate.matchedEventIds,
+          conflicts: true,
+          reason: '仲裁器调用失败，已按冲突标记写入',
+        });
+      }
+      return this.applyAgentEventDecision(gate, decision, now);
+    });
+  }
+
+  /** Exact-fingerprint and near-duplicate sweep over the merged live pool. */
+  private scanAgentEventDuplicates(
+    candidate: ExternalMemoryCandidate,
+    candidateTokens: readonly string[],
+    now: string,
+  ): AgentEventRecordResult | null {
+    const live = this.listAllEvents()
+      .filter((event) => event.status !== 'forgotten' && event.status !== 'archived');
+    const candidateFingerprint = externalMemoryFingerprint(candidate);
+    const exact = live.find((event) => externalMemoryFingerprint(event) === candidateFingerprint);
+    if (exact) return this.reinforceAgentEvent(exact, 'exact-duplicate', now);
+    let best: { event: EventCard; score: number } | null = null;
+    for (const event of live) {
+      const score = tokenContainment(candidateTokens, searchTokens(`${event.title} ${event.summary}`));
+      if (score > (best?.score ?? 0)) best = { event, score };
+    }
+    if (best && best.score >= AGENT_EVENT_NEAR_DUPLICATE) {
+      return this.reinforceAgentEvent(best.event, 'near-duplicate', now);
+    }
+    return null;
+  }
+
+  private applyAgentEventDecision(
+    gate: { candidate: ExternalMemoryCandidate; ambiguous: readonly string[]; matchedEventIds: readonly string[] },
+    decision: ExternalMemoryDecision,
+    now: string,
+  ): AgentEventRecordResult {
+    const allowed = new Set(gate.matchedEventIds);
+    const existingEventIds = [...new Set((decision.existingEventIds ?? []).filter((id) => allowed.has(id)))];
+    const requestedAction = this.normalizeExternalAction(decision.action);
+    const confidence = Number.isFinite(decision.confidence)
+      ? Math.max(0, Math.min(1, decision.confidence!))
+      : 0.5;
+    const reason = typeof decision.reason === 'string' && decision.reason.trim()
+      ? decision.reason.trim().slice(0, 500)
+      : undefined;
+    const mergedCandidate = decision.mergedCandidate
+      && typeof decision.mergedCandidate.title === 'string' && decision.mergedCandidate.title.trim()
+      && typeof decision.mergedCandidate.summary === 'string' && decision.mergedCandidate.summary.trim()
+      ? decision.mergedCandidate
+      : undefined;
+
+    if (requestedAction === 'IGNORE') {
+      return {
+        action: 'IGNORED', gate: 'decider', recorded: false,
+        existingEventIds, matchedEventIds: [...gate.matchedEventIds], confidence,
+        ...(reason ? { reason } : {}),
+      };
+    }
+    if ((requestedAction === 'MERGE' || requestedAction === 'SUPERSEDE')
+      && (existingEventIds.length === 0 || confidence < EXTERNAL_MEMORY_AUTO_APPLY_CONFIDENCE)) {
+      // Never silently supersede on a low-confidence or target-less decision:
+      // write non-destructively and mark the conflict instead.
+      return this.writeAgentEvent(mergedCandidate ?? gate.candidate, 'CONFLICT_MARKED', 'decider', existingEventIds, {
+        now,
+        matchedEventIds: gate.matchedEventIds,
+        confidence,
+        conflicts: true,
+        downgradedFrom: requestedAction as 'MERGE' | 'SUPERSEDE',
+        ...(reason ? { reason } : {}),
+      });
+    }
+    switch (requestedAction) {
+      case 'ADD':
+        return this.writeAgentEvent(mergedCandidate ?? gate.candidate, 'ADDED', 'decider', [], {
+          now, matchedEventIds: gate.matchedEventIds, confidence, ...(reason ? { reason } : {}),
+        });
+      case 'MERGE':
+      case 'SUPERSEDE':
+        return this.writeAgentEvent(mergedCandidate ?? gate.candidate, requestedAction === 'MERGE' ? 'MERGED' : 'SUPERSEDED', 'decider', existingEventIds, {
+          now, matchedEventIds: gate.matchedEventIds, confidence, supersedes: true, ...(reason ? { reason } : {}),
+        });
+      default:
+        return this.writeAgentEvent(gate.candidate, 'CONFLICT_MARKED', 'decider', existingEventIds, {
+          now, matchedEventIds: gate.matchedEventIds, confidence, conflicts: true, ...(reason ? { reason } : {}),
+        });
+    }
+  }
+
+  private reinforceAgentEvent(
+    event: EventCard,
+    gate: AgentEventRecordResult['gate'],
+    now: string,
+  ): AgentEventRecordResult {
+    // Inline mutation only: recordMemoryUse would await commitMutation and
+    // deadlock the queue this gate already holds.
+    event.weight.mentionCount += 1;
+    event.weight.lastAdoptedTurn = this.currentTurn;
+    event.updatedAt = now;
+    return {
+      action: 'REINFORCED',
+      gate,
+      recorded: false,
+      reinforcedEventId: event.id,
+      existingEventIds: [event.id],
+      matchedEventIds: [event.id],
+      confidence: 1,
+      weight: Number(memoryWeightAt(event, this.currentTurn).toFixed(3)),
+    };
+  }
+
+  /**
+   * Provenance for one agent recording: cite the real conversation messages of
+   * the recording session — the most recent open-tail user/assistant messages
+   * when available, otherwise the latest sealed block of that thread. Only
+   * when the session has no ingested messages at all does a synthetic
+   * provenance block get created (mirroring the external-import fallback).
+   */
+  private resolveAgentEventProvenance(
+    candidate: ExternalMemoryCandidate,
+    threadId: string | undefined,
+    now: string,
+  ): { messageIds: string[]; sourceBlockId?: string; synthetic: boolean } {
+    const real = threadId
+      ? this.listOpenTail(threadId).filter((message) => message.role === 'user' || message.role === 'assistant')
+      : [];
+    if (real.length > 0) {
+      return { messageIds: real.slice(-AGENT_EVENT_PROVENANCE_LIMIT).map(({ id }) => id), synthetic: false };
+    }
+    const sealed = threadId
+      ? this.blocks.filter((block) => block.threadId === threadId && block.l5Raw.length > 0)
+      : [];
+    const last = sealed.at(-1);
+    if (last) {
+      return {
+        messageIds: last.l5Raw.slice(-AGENT_EVENT_PROVENANCE_LIMIT).map(({ id }) => id),
+        sourceBlockId: last.id,
+        synthetic: false,
+      };
+    }
+    const source = this.createAgentSourceBlock(candidate.summary, now, candidate.tags ?? []);
+    return { messageIds: [source.l5Raw[0]!.id], sourceBlockId: source.id, synthetic: true };
+  }
+
+  private writeAgentEvent(
+    candidate: ExternalMemoryCandidate,
+    action: AgentEventRecordResult['action'],
+    gate: AgentEventRecordResult['gate'],
+    targetIds: readonly string[],
+    opts: {
+      now: string
+      matchedEventIds: readonly string[]
+      confidence?: number
+      reason?: string
+      downgradedFrom?: 'MERGE' | 'SUPERSEDE'
+      supersedes?: boolean
+      conflicts?: boolean
+    },
+  ): AgentEventRecordResult {
+    const criticality: MemoryCriticality = candidate.memoryKind === 'preference' ? 'preference' : 'routine';
+    const threadId = typeof candidate.temporal?.threadId === 'string' && candidate.temporal.threadId.trim()
+      ? candidate.temporal.threadId
+      : undefined;
+    const provenance = this.resolveAgentEventProvenance(candidate, threadId, opts.now);
+    const input: AgentEventCardInput = {
+      ...candidate,
+      sourceMessageIds: provenance.messageIds,
+      ...(provenance.sourceBlockId !== undefined ? { sourceBlockId: provenance.sourceBlockId } : {}),
+      scope: 'user',
+      criticality,
+      temporal: {
+        ...(candidate.temporal ?? {}),
+        ...(opts.supersedes ? { supersedesEventIds: [...targetIds] } : {}),
+        ...(opts.conflicts ? { conflictsWithEventIds: [...targetIds] } : {}),
+      },
+    };
+    const event = provenance.synthetic
+      ? this.addEventInMemory(input as EventCardInput, this.agentEvents)
+      : this.addAgentEventInMemory(input, this.agentEvents);
+    if (targetIds.length > 0) {
+      for (const id of targetIds) {
+        const existing = this.findEvent(id);
+        if (!existing || existing.id === event.id) continue;
+        existing.temporal.conflictsWithEventIds = [...new Set([...(existing.temporal.conflictsWithEventIds ?? []), event.id])];
+        existing.updatedAt = opts.now;
+      }
+    }
+    this.queueElementProjection([event.id]);
+    this.queueGraphProjection([event.id], 2_000);
+    return {
+      action,
+      gate,
+      recorded: true,
+      eventId: event.id,
+      existingEventIds: [...targetIds],
+      matchedEventIds: [...opts.matchedEventIds],
+      ...(opts.confidence !== undefined ? { confidence: opts.confidence } : {}),
+      ...(opts.downgradedFrom !== undefined ? { downgradedFrom: opts.downgradedFrom } : {}),
+      ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+      ...(provenance.sourceBlockId !== undefined ? { sourceBlockId: provenance.sourceBlockId } : {}),
+      sourceMessageIds: provenance.messageIds,
+      weight: Number(memoryWeightAt(event, this.currentTurn).toFixed(3)),
+    };
+  }
+
+  private addEventInMemory(input: EventCardInput, pool: EventCard[] = this.events): EventCard {
     const sourceBlock = this.blocks.find((block) => block.id === input.sourceBlockId);
     if (!sourceBlock) throw new Error(`Unknown source block: ${input.sourceBlockId}`);
     const validIds = new Set(sourceBlock.l5Raw.map((message) => message.id));
@@ -1744,55 +2200,98 @@ export class StrataGate {
     const sourceMessageIds = requestedRefs.length > 0 ? requestedRefs : sourceBlock.l5Raw.map((message) => message.id);
     const now = toUtc8Iso(this.now());
     const criticality = input.criticality ?? 'routine';
-    const formedTurn = sourceBlock.threadId?.startsWith('external-import:')
+    const formedTurn = isSyntheticSourceThreadId(sourceBlock.threadId)
       ? this.currentTurn
       : sourceBlock.endTurn;
+    return this.storeEventCard(input, pool, {
+      sourceMessageIds,
+      sourceBlockId: sourceBlock.id,
+      formedTurn,
+      now,
+      criticality,
+    });
+  }
+
+  /**
+   * Agent-recorded variant: provenance may cite real conversation messages
+   * (open tail or sealed blocks) directly, with no source block. Every cited
+   * message must exist in the store; the lifecycle clock starts at the
+   * current turn.
+   */
+  private addAgentEventInMemory(input: AgentEventCardInput, pool: EventCard[]): EventCard {
+    const known = new Set([...this.openTail.map((message) => message.id), ...this.rawMessageLookup.keys()]);
+    const unknown = input.sourceMessageIds.filter((id) => !known.has(id));
+    if (unknown.length > 0) {
+      throw new Error(`Agent event cites unknown source messages: ${unknown.join(', ')}`);
+    }
+    const now = toUtc8Iso(this.now());
+    const criticality = input.criticality ?? 'routine';
+    return this.storeEventCard(input, pool, {
+      sourceMessageIds: [...new Set(input.sourceMessageIds)],
+      ...(input.sourceBlockId !== undefined ? { sourceBlockId: input.sourceBlockId } : {}),
+      formedTurn: input.formedTurn ?? this.currentTurn,
+      now,
+      criticality,
+    });
+  }
+
+  private storeEventCard(
+    input: EventCardInput | AgentEventCardInput,
+    pool: EventCard[],
+    parts: {
+      sourceMessageIds: string[]
+      sourceBlockId?: string
+      formedTurn: number
+      now: string
+      criticality: MemoryCriticality
+    },
+  ): EventCard {
     const event: EventCard = {
       id: input.id ?? this.idFactory('evt'),
-      formedTurn,
+      formedTurn: parts.formedTurn,
       title: input.title.trim(),
       summary: input.summary.trim(),
       narrative: input.narrative?.trim() || input.summary.trim(),
       tags: [...new Set(input.tags ?? [])].slice(0, 12),
       quotes: [...new Set(input.quotes ?? [])].slice(0, 12),
-      sourceMessageIds,
-      sourceBlockId: sourceBlock.id,
+      sourceMessageIds: parts.sourceMessageIds,
+      ...(parts.sourceBlockId !== undefined ? { sourceBlockId: parts.sourceBlockId } : {}),
       temporal: {
-        ...(input.temporal ? { ...input.temporal } : { mentionedAt: now }),
+        ...(input.temporal ? { ...input.temporal } : { mentionedAt: parts.now }),
         eventType: normalizeStandardEventType(input.temporal?.eventType),
       },
       scope: input.scope ?? 'user',
-      criticality,
+      criticality: parts.criticality,
       confidence: Math.max(0, Math.min(1, input.confidence ?? 1)),
       status: 'active',
       supersededBy: null,
       weight: {
         mentionCount: 1,
-        lastAdoptedTurn: formedTurn,
+        lastAdoptedTurn: parts.formedTurn,
         lastRetrievedAt: null,
         pinned: false,
-        floorWeight: criticalityFloor(criticality),
+        floorWeight: criticalityFloor(parts.criticality),
         forcedCap: null,
       },
-      createdAt: now,
-      updatedAt: now,
+      createdAt: parts.now,
+      updatedAt: parts.now,
     };
-    if (this.events.some((candidate) => candidate.id === event.id)) throw new Error(`Duplicate event ID: ${event.id}`);
-    this.events.push(event);
+    if (this.listAllEvents().some((candidate) => candidate.id === event.id)) throw new Error(`Duplicate event ID: ${event.id}`);
+    pool.push(event);
 
     for (const supersededId of event.temporal.supersedesEventIds ?? []) {
-      const old = this.events.find((candidate) => candidate.id === supersededId && candidate.id !== event.id);
-      if (!old) continue;
+      const old = this.findEvent(supersededId);
+      if (!old || old.id === event.id) continue;
       old.status = 'superseded';
       old.supersededBy = event.id;
       old.weight.forcedCap = 0.1;
-      old.updatedAt = now;
+      old.updatedAt = parts.now;
     }
     return event;
   }
 
   private requireEvent(id: string): EventCard {
-    const event = this.events.find((candidate) => candidate.id === id);
+    const event = this.findEvent(id);
     if (!event) throw new Error(`Unknown event: ${id}`);
     return event;
   }
@@ -1804,45 +2303,188 @@ export class StrataGate {
   }
 
   async searchGraphNodes(query: string, limit = 8): Promise<GraphNodeSearchResult[]> {
-    const candidates = this.graphNodes.filter((node) => node.status === 'active' || node.status === 'disputed');
     const queryTokens = [...new Set(searchTokens(query))];
-    const fieldValues = (node: GraphNode): Array<readonly [string, string]> => [
-      ['name', node.name],
-      ['aliases', node.aliases.join(' ')],
-      ['tags', (node.tags ?? []).join(' ')],
-      ['type', node.type],
-      ['currentState', node.currentState],
-      ['facts', node.facts.map((fact) => `${fact.key} ${Array.isArray(fact.value) ? fact.value.join(' ') : fact.value}`).join(' ')],
-      ['relations', this.graphEdges.filter((edge) => edge.fromNodeId === node.id || edge.toNodeId === node.id).map(({ relation }) => relation).join(' ')],
-    ];
-    const ranked = bm25Rank(candidates, query, (node) => weightedSearchTokens([
-      [node.name, 6], [node.aliases.join(' '), 5], [(node.tags ?? []).join(' '), 5], [node.type, 2], [node.currentState, 4],
-      [node.facts.map((fact) => `${fact.key} ${Array.isArray(fact.value) ? fact.value.join(' ') : fact.value}`).join(' '), 4],
-      [this.graphEdges.filter((edge) => edge.fromNodeId === node.id || edge.toNodeId === node.id).map(({ relation }) => relation).join(' '), 3],
-    ])).filter(({ item }) => {
-      const fields = fieldValues(item);
-      const matches = fields.filter(([, value]) => {
-        const haystack = new Set(searchTokens(value));
-        return queryTokens.some((token) => haystack.has(token));
-      }).map(([field]) => field);
-      // Relation text is useful context, but relation-only hits are commonly
-      // adjacent/noise nodes. Keep type-only hits so valid project/tool/etc.
-      // searches continue to work, while requiring a descriptive field for
-      // ordinary lexical queries.
-      if (!matches.some((field) => field !== 'relations')) return false;
-      return matches.some((field) => field !== 'relations');
-    }).slice(0, Math.max(1, Math.min(20, limit)));
-    if (searchTokens(query).length > 0 && ranked.length === 0) return [];
-    return ranked.map(({ item: node, score }) => {
-      const matchedFields = fieldValues(node).filter(([, value]) => {
-        const haystack = new Set(searchTokens(value));
-        return queryTokens.some((token) => haystack.has(token));
-      }).map(([field]) => field);
+    if (queryTokens.length === 0) return [];
+    const views = this.graphNodes.flatMap((node) => effectiveGraphNodeView(node, this.graphEdges, this.listAllEvents()) ?? []);
+    const viewById = new Map(views.map((view) => [view.node.id, view]));
+    const dedupe = <T>(values: readonly T[]): T[] => [...new Set(values)];
+    const factValue = (fact: GraphNode['facts'][number]): string =>
+      Array.isArray(fact.value) ? fact.value.join(' ') : fact.value;
+    const endpoint = (nodeId: string, edge: GraphEdge): string => {
+      const otherId = edge.fromNodeId === nodeId ? edge.toNodeId : edge.fromNodeId;
+      const other = viewById.get(otherId)?.node;
+      return other ? `${other.name} ${other.aliases.join(' ')}` : '';
+    };
+    const tokenSet = (value: string): Set<string> => new Set(searchTokens(value));
+    const hasAny = (value: string, tokens: readonly string[]): boolean => {
+      const available = tokenSet(value);
+      return tokens.some((token) => available.has(token));
+    };
+    const matchDetails = (node: GraphNode) => {
+      const view = viewById.get(node.id)!;
+      const queryParts = normalizeSearchText(query).split(/[^\p{Letter}\p{Number}_]+/gu).filter(Boolean);
+      const explicitFactKeys = dedupe([...view.currentFacts, ...view.historicalFacts].map(({ key }) => key))
+        .filter((key) => queryParts.includes(normalizeSearchText(key)));
+      const knownFactKeyTokens = new Set(explicitFactKeys.flatMap((key) => [...tokenSet(key)]));
+      const queryKeyTokens = queryTokens.filter((token) => knownFactKeyTokens.has(token));
+      const valueQueryTokens = queryTokens.filter((token) => !queryKeyTokens.includes(token));
+      const meaningfulTokens = queryTokens;
+      const factMatchesFor = (facts: readonly GraphNode['facts'][number][]): GraphNode['facts'][number][] => {
+        if (queryKeyTokens.length === 0) return facts.filter((fact) => hasAny(`${fact.key} ${factValue(fact)}`, meaningfulTokens));
+        const keyFacts = facts.filter((fact) => queryKeyTokens.some((token) => tokenSet(fact.key).has(token)));
+        const directMatches = keyFacts.filter((fact) => valueQueryTokens.length === 0
+          || valueQueryTokens.some((token) => tokenSet(factValue(fact)).has(token)));
+        return directMatches;
+      };
+      let currentFacts = factMatchesFor(view.currentFacts);
+      let historicalFacts = factMatchesFor(view.historicalFacts);
+      const edgeMatches = (edge: GraphEdge, supportingFacts: readonly GraphNode['facts'][number][]): boolean => {
+        if (queryKeyTokens.length === 0) return hasAny(endpoint(node.id, edge), meaningfulTokens);
+        return supportingFacts.length > 0
+          && hasAny(endpoint(node.id, edge), valueQueryTokens.length > 0 ? valueQueryTokens : queryTokens);
+      };
+      let currentEdges = view.currentEdges.filter((edge) => edgeMatches(edge, currentFacts));
+      let historicalEdges = view.historicalEdges.filter((edge) => edgeMatches(edge, historicalFacts));
+      if (queryKeyTokens.length === 0) {
+        const overlap = (value: string): number => {
+          const available = tokenSet(value);
+          return meaningfulTokens.filter((token) => available.has(token)).length;
+        };
+        const scoredFacts = [...currentFacts, ...historicalFacts].map((fact) => [fact.id, overlap(`${fact.key} ${factValue(fact)}`)] as const);
+        const scoredEdges = [...currentEdges, ...historicalEdges].map((edge) => [edge.id, overlap(endpoint(node.id, edge))] as const);
+        const best = Math.max(0, ...scoredFacts.map(([, score]) => score), ...scoredEdges.map(([, score]) => score));
+        const bestFacts = new Set(scoredFacts.filter(([, score]) => score === best).map(([id]) => id));
+        const bestEdges = new Set(scoredEdges.filter(([, score]) => score === best).map(([id]) => id));
+        currentFacts = currentFacts.filter(({ id }) => bestFacts.has(id));
+        historicalFacts = historicalFacts.filter(({ id }) => bestFacts.has(id));
+        currentEdges = currentEdges.filter(({ id }) => bestEdges.has(id));
+        historicalEdges = historicalEdges.filter(({ id }) => bestEdges.has(id));
+      }
+      const metadataFields: Array<readonly [string, string]> = [
+        ['name', node.name],
+        ['aliases', node.aliases.join(' ')],
+        ['tags', (node.tags ?? []).join(' ')],
+        ['type', node.type],
+      ];
+      const metadataMatches = metadataFields.filter(([, value]) => hasAny(value, queryTokens)).map(([field]) => field);
+      const matchedMetadataEventIds = node.metadataProvenance
+        ? dedupe([
+          ...(metadataMatches.includes('name') ? (node.metadataProvenance.name ?? []) : []),
+          ...(node.metadataProvenance.aliases ?? []).filter(({ value }) => hasAny(value, queryTokens)).flatMap(({ sourceEventIds }) => sourceEventIds),
+          ...(node.metadataProvenance.tags ?? []).filter(({ value }) => hasAny(value, queryTokens)).flatMap(({ sourceEventIds }) => sourceEventIds),
+          ...(metadataMatches.includes('type') ? [...view.currentNodeEventIds, ...view.historicalNodeEventIds] : []),
+        ])
+        : metadataMatches.length > 0 ? dedupe([...view.currentNodeEventIds, ...view.historicalNodeEventIds]) : [];
+      const eventStatus = new Map(this.listAllEvents().map((event) => [event.id, event.status]));
+      const metadataCurrentHit = matchedMetadataEventIds.some((id) => eventStatus.get(id) === 'active');
+      const metadataHistoricalHit = matchedMetadataEventIds.some((id) => eventStatus.get(id) === 'superseded');
+      const currentRecordHit = currentFacts.length > 0 || currentEdges.length > 0;
+      const historicalRecordHit = historicalFacts.length > 0 || historicalEdges.length > 0;
+      const hasRecordHit = currentRecordHit || historicalRecordHit;
+      // Entity metadata selects the node, but once a fact/endpoint provides the
+      // semantic match it must not manufacture a second temporal-state hit.
+      const currentHit = currentRecordHit || (!hasRecordHit && metadataMatches.length > 0 && metadataCurrentHit);
+      const historicalHit = historicalRecordHit || (!hasRecordHit && metadataMatches.length > 0 && metadataHistoricalHit);
+      const relationMatches = [...view.currentEdges, ...view.historicalEdges]
+        .some((edge) => hasAny(edge.relation, queryTokens));
+      const matchedFields = [
+        ...metadataMatches,
+        ...(currentFacts.length > 0 ? ['currentFacts'] : []),
+        ...(historicalFacts.length > 0 ? ['historicalFacts'] : []),
+        ...(currentEdges.length > 0 ? ['currentEdgeEndpoints'] : []),
+        ...(historicalEdges.length > 0 ? ['historicalEdgeEndpoints'] : []),
+        ...(relationMatches ? ['relations'] : []),
+      ];
       return {
-        node,
+        view, currentFacts, historicalFacts, currentEdges, historicalEdges,
+        metadataMatches, matchedMetadataEventIds, currentHit, historicalHit, matchedFields,
+      };
+    };
+    const candidates = views.map(({ node }) => node);
+    const ranked = bm25Rank(candidates, query, (node) => {
+      const view = viewById.get(node.id)!;
+      return weightedSearchTokens([
+        [node.name, 6],
+        [node.aliases.join(' '), 5],
+        [(node.tags ?? []).join(' '), 5],
+        [node.type, 2],
+        [view.currentFacts.map((fact) => `${fact.key} ${factValue(fact)}`).join(' '), 4],
+        [view.historicalFacts.map((fact) => `${fact.key} ${factValue(fact)}`).join(' '), 2],
+        [view.currentEdges.map((edge) => endpoint(node.id, edge)).join(' '), 4],
+        [view.historicalEdges.map((edge) => endpoint(node.id, edge)).join(' '), 2],
+        [[...view.currentEdges, ...view.historicalEdges].map(({ relation }) => relation).join(' '), 1],
+      ]);
+    }).filter(({ item }) => {
+      const details = matchDetails(item);
+      return details.currentHit || details.historicalHit;
+    }).slice(0, Math.max(1, Math.min(20, limit)));
+    return ranked.map(({ item: node, score }) => {
+      const details = matchDetails(node);
+      const matchedEventIds = dedupe([
+        ...details.currentFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+        ...details.historicalFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+        ...details.currentEdges.flatMap(({ sourceEventIds }) => sourceEventIds),
+        ...details.historicalEdges.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ]);
+      const historicalKeys = new Set(details.historicalFacts.map(({ key }) => key));
+      const historicalRelations = new Set(details.historicalEdges.map(({ relation }) => relation));
+      const currentContextEventIds = dedupe([
+        ...details.view.currentFacts.filter(({ key }) => historicalKeys.has(key)).flatMap(({ sourceEventIds }) => sourceEventIds),
+        ...details.view.currentEdges.filter(({ relation }) => historicalRelations.has(relation)).flatMap(({ sourceEventIds }) => sourceEventIds),
+      ]);
+      const currentContextFacts = details.view.currentFacts.filter(({ key }) => historicalKeys.has(key));
+      const currentContextEdges = details.view.currentEdges.filter(({ relation }) => historicalRelations.has(relation));
+      const nameEventIds = node.metadataProvenance?.name ?? [];
+      const metadataCandidates = dedupe([...details.matchedMetadataEventIds, ...nameEventIds]);
+      const metadataOnly = matchedEventIds.length === 0 && details.metadataMatches.length > 0;
+      const hasVisibleLegacyMetadata = !node.metadataProvenance
+        && Boolean(node.name || node.aliases.length > 0 || (node.tags?.length ?? 0) > 0);
+      const legacyMetadataEventIds = hasVisibleLegacyMetadata
+        ? dedupe([...details.view.currentNodeEventIds, ...details.view.historicalNodeEventIds])
+        : [];
+      const recordPriority = dedupe([
+        ...matchedEventIds,
+        ...currentContextEventIds,
+      ]);
+      const legacyMetadataFits = node.metadataProvenance !== undefined || !hasVisibleLegacyMetadata
+        || dedupe([...recordPriority, ...legacyMetadataEventIds]).length <= GRAPH_PROVENANCE_LIMIT;
+      const legacyMetadataNotExpanded = hasVisibleLegacyMetadata && !legacyMetadataFits;
+      const prioritized = node.metadataProvenance
+        ? dedupe([
+          ...matchedEventIds,
+          ...(metadataOnly ? metadataCandidates : []),
+          ...currentContextEventIds,
+          ...(!metadataOnly ? metadataCandidates : []),
+        ])
+        : recordPriority;
+      const provenanceEventIds = dedupe([
+        ...prioritized,
+        ...(legacyMetadataFits ? legacyMetadataEventIds : []),
+      ]).slice(0, GRAPH_PROVENANCE_LIMIT);
+      const evidenceIds = new Set(provenanceEventIds);
+      const boundedView = boundEffectiveGraphNodeView(details.view, evidenceIds, {
+        preserveLegacyMetadata: legacyMetadataNotExpanded,
+      });
+      const bounded = <T extends GraphFact | GraphEdge>(record: T): T | null => {
+        const sourceEventIds = record.sourceEventIds.filter((id) => evidenceIds.has(id));
+        return sourceEventIds.length > 0 ? { ...record, sourceEventIds } : null;
+      };
+      const matchType = details.currentHit && details.historicalHit
+        ? 'both' as const
+        : details.historicalHit ? 'historical' as const : 'current' as const;
+      return {
+        node: boundedView.node,
         score,
-        matchedFields,
-        matchReason: `Lexical match in ${matchedFields.join(', ') || 'indexed fields'}; score is ranking-only.`,
+        matchedFields: details.matchedFields,
+        matchReason: `Meaningful ${matchType} match in ${details.matchedFields.join(', ')}; relation text is ranking-only.`,
+        matchType,
+        currentFacts: dedupe([...details.currentFacts, ...currentContextFacts]).flatMap((record) => bounded(record) ?? []),
+        historicalFacts: details.historicalFacts.flatMap((record) => bounded(record) ?? []),
+        currentEdges: dedupe([...details.currentEdges, ...currentContextEdges]).flatMap((record) => bounded(record) ?? []),
+        historicalEdges: details.historicalEdges.flatMap((record) => bounded(record) ?? []),
+        provenanceEventIds,
+        ...(legacyMetadataNotExpanded ? { metadataEvidenceStatus: 'not_expanded' as const } : {}),
+        timeline: graphTimeline(provenanceEventIds, this.listAllEvents()),
       };
     });
   }
@@ -1861,7 +2503,7 @@ export class StrataGate {
     const queued = new Set([...this.graphProjectionJobs.values()]
       .filter((job) => job.projectorVersion === KNOWLEDGE_GRAPH_PROJECTOR_VERSION && job.status !== 'completed')
       .flatMap((job) => job.sourceEventIds));
-    const ids = [...new Set(sourceEventIds.filter((id) => this.events.some((event) => event.id === id)
+    const ids = [...new Set(sourceEventIds.filter((id) => this.findEvent(id)
       && !completed.has(id) && !queued.has(id)))];
     if (ids.length === 0) return null;
     const now = toUtc8Iso(this.now());
@@ -1876,7 +2518,7 @@ export class StrataGate {
   }
 
   private queueMissingGraphProjections(): void {
-    const candidates = [...this.events]
+    const candidates = this.listAllEvents()
       .filter((event) => event.status !== 'forgotten' && event.status !== 'archived')
       .sort((left, right) => {
         const score = (event: EventCard): number => (event.status === 'active' ? 10_000 : 0)
@@ -1891,7 +2533,7 @@ export class StrataGate {
 
   private queueElementProjection(sourceEventIds: readonly string[]): ElementProjectionJob | null {
     if (this.disableElementProjection) return null;
-    const ids = [...new Set(sourceEventIds.filter((id) => this.events.some((event) => event.id === id)))];
+    const ids = [...new Set(sourceEventIds.filter((id) => Boolean(this.findEvent(id))))];
     if (ids.length === 0) return null;
     const now = toUtc8Iso(this.now());
     const job: ElementProjectionJob = {
@@ -2172,11 +2814,30 @@ export class StrataGate {
 
     let result: Awaited<ReturnType<EventExtractor>>;
     try {
+      const query = [target.l0Title, target.l1Summary, ...(target.l2Keypoints ?? [])]
+        .filter(Boolean).join(' ');
+      const relevant = query
+        ? (await this.searchEvents(query, { limit: 8, trackRetrieval: false })).map(({ event }) => event)
+        : [];
+      // formedTurn is thread-local; Block sequence preserves order across threads.
+      const sourceSequence = new Map(this.blocks.map((block) => [block.id, block.sequence]));
+      const recent = this.events
+        .filter((event) => event.status === 'active' || event.status === 'superseded')
+        .sort((left, right) => (sourceSequence.get(right.sourceBlockId ?? '') ?? -1)
+          - (sourceSequence.get(left.sourceBlockId ?? '') ?? -1)
+          || (right.formedTurn ?? -1) - (left.formedTurn ?? -1)
+          || right.createdAt.localeCompare(left.createdAt)
+          || right.id.localeCompare(left.id))
+        .slice(0, 4);
+      const timelineEvents = new Map(relevant.map((event) => [event.id, event]));
+      for (const event of recent) {
+        if (!timelineEvents.has(event.id)) timelineEvents.set(event.id, event);
+      }
       result = await this.extractor({
         previous: threadBlocks.slice(0, targetIndex).reverse().find((block) => block.l2Keypoints !== undefined) ?? null,
         target,
         next,
-        timeline: this.events.map((event) => ({ id: event.id, title: event.title, temporal: event.temporal })),
+        timeline: [...timelineEvents.values()].map((event) => ({ id: event.id, title: event.title, temporal: event.temporal })),
       });
     } catch (error) {
       await this.commitMutation(() => {
@@ -2320,6 +2981,7 @@ export class StrataGate {
     this.summaryJobs.clear();
     for (const job of copy.summaryJobs) this.summaryJobs.set(job.blockId, job);
     this.events.splice(0, this.events.length, ...copy.events);
+    this.agentEvents.splice(0, this.agentEvents.length, ...copy.agentEvents);
     this.graphNodes.splice(0, this.graphNodes.length, ...copy.graphNodes);
     this.graphEdges.splice(0, this.graphEdges.length, ...copy.graphEdges);
     this.elements.splice(0, this.elements.length, ...copy.elements);
@@ -2355,9 +3017,19 @@ export class StrataGate {
       messageBlockIds.set(message.id, 'open-tail');
     }
     const eventIds = new Set<string>();
-    for (const event of this.events) {
+    for (const event of this.listAllEvents()) {
       if (eventIds.has(event.id)) throw new Error(`Duplicate event ID in snapshot: ${event.id}`);
       eventIds.add(event.id);
+      if (event.sourceBlockId === undefined) {
+        // Agent-recorded events may cite real conversation messages directly
+        // (open tail or any sealed block) without a provenance block.
+        for (const messageId of event.sourceMessageIds) {
+          if (!messageBlockIds.has(messageId)) {
+            throw new Error(`Event ${event.id} references unknown source message ${messageId}`);
+          }
+        }
+        continue;
+      }
       if (!blockIds.has(event.sourceBlockId)) throw new Error(`Unknown event source block in snapshot: ${event.sourceBlockId}`);
       for (const messageId of event.sourceMessageIds) {
         if (messageBlockIds.get(messageId) !== event.sourceBlockId) {
@@ -2379,7 +3051,7 @@ export class StrataGate {
         if (!eventIds.has(eventId)) throw new Error(`Element ${element.id} references unknown event ${eventId}`);
       }
       const sourceMessageIds = new Set(element.sourceEventIds.flatMap((eventId) =>
-        this.events.find((event) => event.id === eventId)?.sourceMessageIds ?? []));
+        this.findEvent(eventId)?.sourceMessageIds ?? []));
       for (const messageId of element.sourceMessageIds) {
         if (!sourceMessageIds.has(messageId)) {
           throw new Error(`Element ${element.id} references message ${messageId} outside its source events`);
@@ -2421,7 +3093,7 @@ export class StrataGate {
         if (!eventIds.has(eventId)) throw new Error(`Graph edge ${edge.id} references unknown event ${eventId}`);
       }
     }
-    for (const event of this.events) for (const nodeId of event.temporal.participantNodeIds ?? []) {
+    for (const event of this.listAllEvents()) for (const nodeId of event.temporal.participantNodeIds ?? []) {
       if (!graphNodeIds.has(nodeId)) throw new Error(`Event ${event.id} references unknown graph node ${nodeId}`);
     }
     for (const job of this.graphProjectionJobs.values()) {

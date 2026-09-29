@@ -6,11 +6,19 @@ import { openNativePath } from '@deepseek-ai/dsh-native-command'
 import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import {
   DERIVATION_MAX_ATTEMPTS,
+  GRAPH_PROVENANCE_LIMIT,
+  boundEffectiveGraphNodeView,
+  effectiveGraphNodeView,
+  graphTimeline,
   estimateTokens,
+  blockLevelLabel,
+  renderBlock,
   memoryWeightAt,
   rrfRank,
   StorageConflictError,
   StrataGate,
+  renderPersistentProfile,
+  type PersistentProfile,
   type ElementSearchResult,
   type EventCard,
   type EventSearchResult,
@@ -19,11 +27,12 @@ import {
   type ExternalMemoryImportJob,
   type ExternalMemoryImportWorkItem,
   type BlockContextEntry,
-  type GraphNode,
+  type GraphNodeSearchResult,
   type ElementSearchOptions,
   type MemoryCitation,
   type MemoryElementType,
   type MemoryBlock,
+  type BlockLevel,
   type RawMessage,
   type RawSearchHit,
   type RetrievalAssessment,
@@ -33,9 +42,14 @@ import {
   type StrataGateSnapshot,
 } from '@diqier/stratagate'
 import { SqliteStorage } from '@diqier/stratagate/sqlite'
+import type {
+  AgentEventRecordResult,
+  AgentMemoryCategory,
+  ExternalMemoryDecisionContext,
+} from '@diqier/stratagate'
 import type { ResolvedConfig } from './config.js'
 import { TurnFolder, type FoldedTurn } from './fold.js'
-import { dshReplaceSurfaceOp } from './dsh-compatibility.js'
+import { dshMessageSource, dshReplaceSurfaceOp, isStrataGateMessageSource } from './dsh-compatibility.js'
 import { DshModelBridge } from './llm.js'
 import { DshMetadataStore } from './metadata.js'
 
@@ -119,7 +133,6 @@ export interface FeedbackDraft extends Required<Omit<FeedbackDraftInput, 'bodyMa
 const AUTO_EVENT_LIMIT = 4
 const AUTO_ELEMENT_LIMIT = 4
 const AUTO_MEMORY_TOKEN_BUDGET = 900
-const COMPACTION_SOURCE_PLUGIN = 'stratagate-memory'
 const FEEDBACK_PROMPT_COOLDOWN_MS = 5 * 24 * 60 * 60 * 1_000
 
 interface RankedElementFact extends ElementSearchResult {
@@ -234,12 +247,14 @@ export function feedbackDraftUrl(namespace: string, origin?: string): string {
 }
 
 export class StrataGateRuntime {
+  private profileStorage: SqliteStorage | undefined
   private readonly folder = new TurnFolder()
   private readonly spaces = new Map<string, Promise<StrataGate>>()
   private readonly batches = new Map<string, Map<string, RetrievalBatch>>()
   private readonly latestBatchIds = new Map<string, string>()
   private readonly workspaceNames = new Map<string, string>()
   private readonly migrationTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly migrationRuns = new Map<string, Promise<void>>()
   private readonly derivationTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly derivationRuns = new Map<string, Promise<void>>()
   private readonly knownSessions = new Map<string, WeakRef<Session>>()
@@ -258,11 +273,15 @@ export class StrataGateRuntime {
   private readonly backgroundNamespaceRuns = new Map<string, Promise<void>>()
   private backgroundWorkerTimer: ReturnType<typeof setTimeout> | undefined
   private backgroundWorkerRun: Promise<void> | undefined
+  private backgroundWorkerWakePending = false
+  private profileMaintenanceRun: Promise<boolean> | undefined
+  private readonly disposeAdaptersUpdated: () => void
   private settingsTail: Promise<void> = Promise.resolve()
   private batchSequence = 0
   private closed = false
   private blockTurnSize: number
   private blockDecayLambda: number
+  private agentMemoryRetrievalWeight: number
   private transientLastFeedbackPromptAt: string | null = null
 
   constructor(
@@ -275,7 +294,13 @@ export class StrataGateRuntime {
   ) {
     this.blockTurnSize = config.blockTurnSize
     this.blockDecayLambda = config.blockDecayLambda
+    this.agentMemoryRetrievalWeight = config.agentMemoryRetrievalWeight ?? 1
+    this.disposeAdaptersUpdated = this.models.onAdaptersUpdated(() => this.wakeModelWorkers())
     this.scheduleBackgroundWorker(BACKGROUND_WORKER_INITIAL_DELAY_MS)
+  }
+
+  get agentMemoryEnabled(): boolean {
+    return this.config.agentMemoryEnabled !== false
   }
 
   /** Keep durable model jobs moving even when no host session emits events. */
@@ -287,14 +312,17 @@ export class StrataGateRuntime {
       this.backgroundWorkerRun = run
       void run.finally(() => {
         if (this.backgroundWorkerRun === run) this.backgroundWorkerRun = undefined
-        this.scheduleBackgroundWorker(BACKGROUND_WORKER_INTERVAL_MS)
+        const delay = this.backgroundWorkerWakePending ? 0 : BACKGROUND_WORKER_INTERVAL_MS
+        this.backgroundWorkerWakePending = false
+        this.scheduleBackgroundWorker(delay)
       })
     }, delayMs)
     this.backgroundWorkerTimer.unref?.()
   }
 
   private async runBackgroundWorker(): Promise<void> {
-    if (this.closed) return
+    if (this.closed || !this.models.isReady()) return
+    void this.runProfileMaintenance().catch((error: unknown) => this.onIngestError(error))
     let namespaces: string[]
     try {
       namespaces = await this.adminNamespaces()
@@ -312,7 +340,55 @@ export class StrataGateRuntime {
     }
   }
 
+  async runProfileMaintenance(now = Date.now()): Promise<boolean> {
+    if (this.profileMaintenanceRun) return this.profileMaintenanceRun
+    if (this.closed || !this.models.isReady() || !this.profileStore().profileMaintenanceDue(now)) return false
+    const run = (async () => {
+      const current = this.profileStore().getPersistentProfile()
+      try {
+        const proposed = await this.models.runDetached('stratagate-profile-maintenance', () => this.models.maintainProfile(current))
+        return this.profileStore().applyProfileMaintenance(current, proposed, new Date(now).toISOString())
+      } catch (error) {
+        this.profileStore().recordProfileMaintenanceFailure(current, now)
+        throw error
+      }
+    })()
+    this.profileMaintenanceRun = run
+    try { return await run } finally { if (this.profileMaintenanceRun === run) this.profileMaintenanceRun = undefined }
+  }
+
+  getPersistentProfile(): PersistentProfile {
+    return this.profileStore().getPersistentProfile()
+  }
+
+  getProfileSnapshot() {
+    return this.profileStore().getProfileSnapshot()
+  }
+
+  renderProfileContext(): string | null {
+    return renderPersistentProfile(this.getPersistentProfile())
+  }
+
+  getProfileChanges() {
+    return this.profileStore().getProfileChanges()
+  }
+
+  updatePersistentProfile(field: string, value: string, source: 'settings' | 'user_explicit' | 'agent_tool', sourceMessageId?: string | null, expectedValue?: string, expectedRevision?: number) {
+    const result = this.profileStore().updateProfileField(field, value, source, sourceMessageId, expectedValue, expectedRevision)
+    if (result.modified) this.wakeBackgroundWorker()
+    return result
+  }
+
+  private profileStore(): SqliteStorage {
+    return this.profileStorage ??= new SqliteStorage({ filename: this.config.database })
+  }
+
+  updatePersistentProfileFromTool(field: string, value: string) {
+    return this.updatePersistentProfile(field, value, 'agent_tool')
+  }
+
   private async runBackgroundNamespace(namespace: string): Promise<void> {
+    if (this.closed || !this.models.isReady()) return
     const existing = this.backgroundNamespaceRuns.get(namespace)
     if (existing) return existing
     const run = (async () => {
@@ -334,9 +410,11 @@ export class StrataGateRuntime {
           ...this.derivationTimers.keys(),
           ...this.derivationRuns.keys(),
           ...this.migrationTimers.keys(),
+          ...this.migrationRuns.keys(),
         ]
           .some((key) => key.startsWith(`${namespace}\u0000`) || key === namespace)
         if (hasActiveSessionWork) return
+        if (!this.models.isReady()) return
         const resumed = await this.models.runDetached(
           `stratagate-worker:${namespace}`,
           () => memory.resumePendingWork(),
@@ -362,6 +440,35 @@ export class StrataGateRuntime {
       await run
     } finally {
       if (this.backgroundNamespaceRuns.get(namespace) === run) this.backgroundNamespaceRuns.delete(namespace)
+    }
+  }
+
+  private wakeBackgroundWorker(): void {
+    if (this.closed) return
+    if (this.backgroundWorkerTimer) {
+      clearTimeout(this.backgroundWorkerTimer)
+      this.backgroundWorkerTimer = undefined
+    }
+    if (this.backgroundWorkerRun) {
+      this.backgroundWorkerWakePending = true
+      return
+    }
+    this.scheduleBackgroundWorker(0)
+  }
+
+  private wakeModelWorkers(): void {
+    if (this.closed) return
+    this.wakeBackgroundWorker()
+    for (const reference of this.knownSessions.values()) {
+      const session = reference.deref()
+      if (!session || !this.models.isReady(session)) continue
+      const opening = this.spaces.get(this.namespaceFor(session))
+      if (!opening) continue
+      void opening.then((memory) => {
+        if (this.closed || !this.models.isReady(session)) return
+        this.scheduleGraphMigration(session, memory)
+        this.scheduleBlockDerivation(session, memory)
+      }).catch((error: unknown) => this.onIngestError(error))
     }
   }
 
@@ -462,15 +569,25 @@ export class StrataGateRuntime {
 
   async searchEvents(session: Session, query: string, options: SearchOptions = {}): Promise<unknown> {
     await this.flush()
-    const results = await (await this.space(session)).searchEvents(query, options)
-    return this.batch(session, results.map(({ event }) => ({
-      ref: `event:${event.id}`,
-      target: {
-        eventIds: [event.id],
-        elementIds: [],
-        citation: citation('event', event.id, event.title, `event:${event.id}`, 'eventId'),
-      },
-    })), results.map(({ event, score }) => compactEvent(event, score)))
+    const results = await (await this.space(session)).searchEvents(query, {
+      ...options,
+      // Agent-recorded events ride their own top-k lane and fuse with the
+      // passive pool by the configured weight; they arrive as ordinary event
+      // results with the same evidence refs and reinforcement path.
+      agentMemoryWeight: this.agentMemoryRetrievalWeight,
+    })
+    return this.batch(
+      session,
+      results.map(({ event }) => ({
+        ref: `event:${event.id}`,
+        target: {
+          eventIds: [event.id],
+          elementIds: [],
+          citation: citation('event', event.id, event.title, `event:${event.id}`, 'eventId'),
+        },
+      })),
+      results.map(({ event, score }) => compactEvent(event, score)),
+    )
   }
 
   async searchElements(session: Session, query: string, options: ElementSearchOptions = {}): Promise<unknown> {
@@ -583,7 +700,7 @@ export class StrataGateRuntime {
 
   async expandEvent(session: Session, id: string): Promise<unknown> {
     await this.flush()
-    const event = (await this.space(session)).listEvents().find((candidate) => candidate.id === id)
+    const event = (await this.space(session)).listAllEvents().find((candidate) => candidate.id === id)
     if (!event) throw new Error(`Unknown event: ${id}`)
     return this.batch(session, [{
       ref: `event:${event.id}`,
@@ -761,26 +878,36 @@ export class StrataGateRuntime {
     const memory = await this.space(session)
     const threadId = String(session.id)
     const blockContexts = memory.getBlockContext(threadId)
-    if (this.syncDecayedBlockSurface(session, blockContexts)) {
+    if (this.syncDecayedBlockSurface(session, memory, blockContexts)) {
       await this.flushNativeSession(session)
     }
     const openTail = memory.listOpenTail(threadId)
     const activationQuery = [currentUserMessage(session), renderMessages(recentTurns(openTail, 2))]
       .filter(Boolean)
       .join('\n\n')
-    const eventHits = activationQuery ? await memory.searchEvents(activationQuery, { limit: 20 }) : []
-    let graphNodes: GraphNode[] = []
+    const eventHits = activationQuery
+      ? await memory.searchEvents(activationQuery, {
+          limit: 20,
+          agentMemoryWeight: this.agentMemoryRetrievalWeight,
+        })
+      : []
+    let graphResults: GraphNodeSearchResult[] = []
     if (activationQuery && typeof memory.searchGraphNodes === 'function') {
-      graphNodes = (await memory.searchGraphNodes(activationQuery, 12)).map(({ node }) => node)
+      graphResults = await memory.searchGraphNodes(activationQuery, 12)
     } else if (activationQuery) {
       // Compatibility for an in-flight older core instance; new persistent
       // spaces always use Graph nodes and never create new Element cards.
       const legacy = activatedElements(memory, await memory.searchElements(activationQuery, { limit: 12 }))
-      graphNodes = legacy.map((item) => ({
-        id: item.elementId, name: item.name, type: item.type, aliases: [], currentState: '', status: 'active',
-        confidence: item.fact.confidence ?? 0.8, sourceEventIds: item.fact.sourceEventIds,
-        facts: [{ ...item.fact, confidence: item.fact.confidence ?? 0.8, status: item.fact.status === 'disputed' ? 'disputed' : item.fact.status === 'superseded' ? 'superseded' : 'active' }],
-        createdAt: item.fact.createdAt, updatedAt: item.fact.updatedAt,
+      graphResults = legacy.map((item) => ({
+        node: {
+          id: item.elementId, name: item.name, type: item.type, aliases: [], currentState: '', status: 'active',
+          confidence: item.fact.confidence ?? 0.8, sourceEventIds: item.fact.sourceEventIds,
+          facts: [{ ...item.fact, confidence: item.fact.confidence ?? 0.8, status: item.fact.status === 'disputed' ? 'disputed' : item.fact.status === 'superseded' ? 'superseded' : 'active' }],
+          createdAt: item.fact.createdAt, updatedAt: item.fact.updatedAt,
+        },
+        score: item.score,
+        matchType: item.fact.status === 'superseded' ? 'historical' : 'current',
+        provenanceEventIds: item.fact.sourceEventIds,
       }))
     }
 
@@ -788,17 +915,17 @@ export class StrataGateRuntime {
     const currentBlockIds = new Set(memory.listBlocks()
       .filter((block) => block.threadId === threadId)
       .map(({ id }) => id))
-    const currentEventIds = new Set(memory.listEvents()
-      .filter((event) => currentBlockIds.has(event.sourceBlockId))
+    const currentEventIds = new Set(memory.listAllEvents()
+      .filter((event) => event.sourceBlockId !== undefined && currentBlockIds.has(event.sourceBlockId))
       .map(({ id }) => id))
     const longTermEvents = events
       .filter((event) => !currentEventIds.has(event.id))
       .slice(0, AUTO_EVENT_LIMIT)
-    graphNodes = graphNodes
-      .filter((node) => !node.sourceEventIds.some((id) => currentEventIds.has(id)))
+    graphResults = graphResults
+      .filter((result) => !(result.provenanceEventIds ?? result.node.sourceEventIds).some((id) => currentEventIds.has(id)))
       .slice(0, AUTO_ELEMENT_LIMIT)
 
-    return renderActivatedMemory(longTermEvents, graphNodes)
+    return renderActivatedMemory(longTermEvents, graphResults)
   }
 
   /**
@@ -810,35 +937,57 @@ export class StrataGateRuntime {
     session: Session,
     block: MemoryBlock,
     context: BlockContextEntry,
-    endTurn: number,
-  ): void {
-    const sourceEventSeqs = sealedSurfaceSeqs(session, endTurn, block.endTurn - block.startTurn + 1)
+    endTurn: number | null,
+  ): boolean {
+    if (endTurn === null || hostCompactionActive(session)) return false
+    const sourceEventSeqs = sealedSurfaceSeqs(session, endTurn, block)
+    if (!sourceEventSeqs) return false
     const start = sourceEventSeqs[0]
     const end = sourceEventSeqs.at(-1)
-    if (start === undefined || end === undefined) {
-      throw new Error(`Cannot compact StrataGate block ${block.id}: no DSH surface range was found`)
-    }
+    if (start === undefined || end === undefined) return false
+    const selected = selectCompressedBlockSurface(session, sourceEventSeqs, block, context)
+    if (!selected) return false
     session.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: renderBlockSurfaceMessage(context) }],
-      source: { kind: 'plugin', plugin: COMPACTION_SOURCE_PLUGIN },
+      content: [{ type: 'text', text: selected }],
+      source: dshMessageSource(),
     }), {
       surfaceOp: dshReplaceSurfaceOp(start, end),
       sourceEventSeqs,
     })
+    return true
   }
 
   /** Keep each native Block checkpoint synchronized with its current decay pointer. */
-  private syncDecayedBlockSurface(session: Session, contexts: readonly BlockContextEntry[]): boolean {
+  private syncDecayedBlockSurface(session: Session, memory: StrataGate, contexts: readonly BlockContextEntry[]): boolean {
+    if (hostCompactionActive(session)) return false
     const current = currentBlockSurfaceMessages(session)
+    const blocks = new Map(memory.listBlocks().map((block) => [block.id, block]))
+    const checkpointLimit = surfaceCheckpointLimit(session)
     let changed = false
     for (const context of contexts) {
       const node = current.get(context.id)
       if (!node) continue
-      const text = renderBlockSurfaceMessage(context)
+      const currentLevel = Number(node.text.match(/^Level: L([0-5]) /mu)?.[1] ?? -1)
+      const currentTokens = surfaceCheckpointTokens(node.text)
+      const sourceTokens = originalCheckpointSourceTokens(session, node.seq)
+      const violatesLimit = currentTokens > checkpointLimit
+        || (sourceTokens !== null && !worthwhileSurfaceReduction(sourceTokens, currentTokens))
+      if (context.level >= currentLevel && currentLevel >= 0 && !violatesLimit) continue
+      const block = blocks.get(context.id)
+      if (!block) continue
+      // A user lift remains available through memory_expand_block. Surface
+      // repair never raises the detail level of an existing checkpoint.
+      const highestLevel = currentLevel >= 0
+        ? Math.min(context.level, currentLevel) as BlockLevel
+        : context.level
+      const text = selectCompressedBlockSurfaceText(
+        node.text, context, block, highestLevel, sourceTokens, checkpointLimit,
+      )
+      if (!text) continue
       if (node.text === text) continue
       session.append('user/message', createUserMessage({
         content: [{ type: 'text', text }],
-        source: { kind: 'plugin', plugin: COMPACTION_SOURCE_PLUGIN },
+        source: dshMessageSource(),
       }), {
         surfaceOp: dshReplaceSurfaceOp(node.seq, node.seq),
         sourceEventSeqs: [node.seq],
@@ -850,6 +999,7 @@ export class StrataGateRuntime {
 
   /** Finish native-surface replacement when an admin retry ran without the target session loaded. */
   private async syncPendingRetrySurface(session: Session, memory: StrataGate): Promise<void> {
+    if (hostCompactionActive(session)) return
     const namespace = this.namespaceFor(session)
     const threadId = String(session.id)
     const pending = [...this.pendingSurfaceSync.entries()]
@@ -867,9 +1017,8 @@ export class StrataGateRuntime {
       const context = contexts.get(blockId)
       if (!block || block.processingStatus !== 'ready' || !context) continue
       try {
-        this.replaceSealedSurface(session, block, context, dshTurnAtBlockEnd(session, block))
+        changed = this.replaceSealedSurface(session, block, context, dshTurnAtBlockEnd(session, block)) || changed
         this.pendingSurfaceSync.delete(key)
-        changed = true
       } catch (error) {
         this.onIngestError(error)
       }
@@ -898,6 +1047,7 @@ export class StrataGateRuntime {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    this.disposeAdaptersUpdated()
     if (this.backgroundWorkerTimer) clearTimeout(this.backgroundWorkerTimer)
     this.backgroundWorkerTimer = undefined
     for (const timer of this.migrationTimers.values()) clearTimeout(timer)
@@ -915,9 +1065,12 @@ export class StrataGateRuntime {
     const settled = await Promise.allSettled(this.spaces.values())
     await Promise.allSettled(this.backgroundNamespaceRuns.values())
     if (this.backgroundWorkerRun) await Promise.allSettled([this.backgroundWorkerRun])
+    if (this.profileMaintenanceRun) await Promise.allSettled([this.profileMaintenanceRun])
+    await Promise.allSettled(this.migrationRuns.values())
     await Promise.allSettled(this.derivationRuns.values())
     await Promise.allSettled(this.externalImportRuns.values())
     await Promise.all(settled.flatMap((result) => result.status === 'fulfilled' ? [result.value.close()] : []))
+    if (this.profileStorage) await this.profileStorage.close()
     this.sessionsById.clear()
     if (flushError !== undefined) throw flushError
   }
@@ -958,6 +1111,99 @@ export class StrataGateRuntime {
     const draft = normalizeFeedbackDraft(input, this.loadFeedbackDraft(key))
     this.saveFeedbackDraft(key, draft)
     return { namespace: key, draft }
+  }
+
+  /**
+   * Record one agent-authored fact through the core long-term Event pipeline.
+   * The pre-write gate deduplicates, merges, supersedes, or conflict-marks
+   * against existing memory; the decider reuses the external-memory contract
+   * and runs under this session's model route.
+   *
+   * The gate holds the namespace mutation queue while the decider runs, so the
+   * decider is bounded by a hard budget (min(structuredTaskTimeoutMs, 30s)); a
+   * timeout degrades to the non-destructive conflict-mark path instead of
+   * stalling every write in the namespace.
+   */
+  async recordAgentMemory(session: Session, content: string, category?: AgentMemoryCategory): Promise<unknown> {
+    if (!this.agentMemoryEnabled) {
+      throw new Error('StrataGate agent memory is disabled by configuration (agentMemoryEnabled=false).')
+    }
+    const memory = await this.space(session)
+    const hasDecider = typeof (this.models as unknown as Record<string, unknown>).externalMemoryDecider === 'function'
+    const deciderBudgetMs = Math.min(this.config.structuredTaskTimeoutMs ?? 120_000, 30_000)
+    const result = await this.models.run(session, () => memory.recordAgentEvent({
+      content,
+      ...(category !== undefined ? { category } : {}),
+      threadId: String(session.id),
+      ...(hasDecider && this.models.isReady(session)
+        ? {
+            decider: async (context: ExternalMemoryDecisionContext) => {
+              const invocation = this.models.externalMemoryDecider(context)
+              let timer: ReturnType<typeof setTimeout> | undefined
+              try {
+                return await Promise.race([
+                  invocation,
+                  new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error('StrataGate agent memory adjudication timed out')), deciderBudgetMs)
+                    timer.unref?.()
+                  }),
+                ])
+              } finally {
+                if (timer) clearTimeout(timer)
+              }
+            },
+          }
+        : {}),
+    }))
+    await this.persistSuccessfulResponses(memory)
+    return this.agentMemoryResultView(session, result)
+  }
+
+  private agentMemoryResultView(session: Session, result: AgentEventRecordResult): Record<string, unknown> {
+    return {
+      recorded: result.recorded,
+      action: result.action,
+      gate: result.gate,
+      ...(result.eventId !== undefined ? { eventId: result.eventId } : {}),
+      ...(result.reinforcedEventId !== undefined ? { reinforcedEventId: result.reinforcedEventId } : {}),
+      ...(result.existingEventIds.length > 0 ? { existingEventIds: result.existingEventIds } : {}),
+      ...(result.confidence !== undefined ? { confidence: result.confidence } : {}),
+      ...(result.downgradedFrom !== undefined ? { downgradedFrom: result.downgradedFrom } : {}),
+      ...(result.reason !== undefined ? { reason: result.reason } : {}),
+      ...(result.sourceBlockId !== undefined ? { sourceBlockId: result.sourceBlockId } : {}),
+      ...(result.weight !== undefined ? { weight: result.weight } : {}),
+      namespace: this.namespaceFor(session),
+      detailHint: 'Recorded into the long-term StrataGate memory; recall it with memory_search_events.',
+    }
+  }
+
+  async adminAgentMemories(options: { sessionId?: string; includeArchived?: boolean } = {}): Promise<unknown> {
+    const items: Array<Record<string, unknown>> = []
+    for (const { namespace, snapshot } of await this.adminSnapshotEntries()) {
+      for (const event of snapshot.agentEvents) {
+        const sessionId = typeof event.temporal.threadId === 'string' ? event.temporal.threadId : ''
+        if (options.sessionId !== undefined && options.sessionId !== '' && sessionId !== options.sessionId) continue
+        if (options.includeArchived !== true && event.status !== 'active' && event.status !== 'superseded') continue
+        items.push({
+          id: event.id,
+          namespace,
+          ...(sessionId ? { sessionId } : {}),
+          title: event.title,
+          content: event.summary,
+          category: event.tags.find((tag) => tag.startsWith('category:'))?.slice('category:'.length),
+          status: event.status,
+          scope: event.scope,
+          criticality: event.criticality,
+          supersededBy: event.supersededBy,
+          createdAt: event.createdAt,
+          updatedAt: event.updatedAt,
+          sourceBlockId: event.sourceBlockId,
+          weight: Number(memoryWeightAt(event, snapshot.currentTurn).toFixed(3)),
+        })
+      }
+    }
+    items.sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))
+    return { items, total: items.length }
   }
 
   notePluginError(session: Session, _error?: unknown): void {
@@ -1077,6 +1323,7 @@ export class StrataGateRuntime {
     try {
       this.blockTurnSize = metadata.blockTurnSize() ?? this.config.blockTurnSize
       this.blockDecayLambda = metadata.blockDecayLambda() ?? this.config.blockDecayLambda
+      this.agentMemoryRetrievalWeight = metadata.agentMemoryRetrievalWeight() ?? this.config.agentMemoryRetrievalWeight ?? 1
     } finally {
       metadata.close()
     }
@@ -1414,6 +1661,27 @@ export class StrataGateRuntime {
     return value
   }
 
+  /** Runtime-tunable agent-memory retrieval share (0–5); persisted next to the Block knobs. */
+  adminAgentMemoryRetrievalWeight(): number {
+    return this.agentMemoryRetrievalWeight
+  }
+
+  adminSetAgentMemoryRetrievalWeight(value: number): number {
+    if (!Number.isFinite(value) || value < 0 || value > 5) {
+      throw new TypeError('agentMemoryRetrievalWeight must be a finite number between 0 and 5')
+    }
+    this.agentMemoryRetrievalWeight = value
+    try {
+      if (this.config.database !== ':memory:') {
+        const metadata = new DshMetadataStore(this.config.database)
+        try { metadata.setAgentMemoryRetrievalWeight(value) } finally { metadata.close() }
+      }
+    } catch (error) {
+      this.onIngestError(error)
+    }
+    return value
+  }
+
   async adminSetBlockTurnSize(value: number): Promise<number> {
     if (!Number.isSafeInteger(value) || value < 1) {
       throw new TypeError('blockTurnSize must be a positive integer')
@@ -1483,7 +1751,7 @@ export class StrataGateRuntime {
           ? memory.listGraphProjectionJobs().find((candidate) => candidate.id === jobId)
           : undefined
         const blockId = kind === 'graph-projection'
-          ? graphJob?.sourceEventIds.flatMap((eventId) => memory.listEvents().find(({ id: eventCandidateId }) => eventCandidateId === eventId)?.sourceBlockId ?? [])[0]
+          ? graphJob?.sourceEventIds.flatMap((eventId) => memory.listAllEvents().find(({ id: eventCandidateId }) => eventCandidateId === eventId)?.sourceBlockId ?? [])[0]
           : jobId
         const block = blockId ? memory.listBlocks().find((candidate) => candidate.id === blockId) : undefined
         if (kind !== 'graph-projection' && !block) throw new Error(`Unknown block: ${jobId}`)
@@ -1494,6 +1762,9 @@ export class StrataGateRuntime {
           if (kind === 'block-summary') return memory.retryBlockSummary(jobId)
           if (kind === 'event-extraction') return memory.retryEventExtraction(jobId)
           return memory.retryGraphProjection(jobId)
+        }
+        if (!this.models.isReady(session)) {
+          throw new Error('StrataGate model adapter is not ready; retry after DSH finishes registering adapters')
         }
         const result = session && this.namespaceFor(session) === key
           ? await this.models.run(session, retry)
@@ -1625,7 +1896,9 @@ export class StrataGateRuntime {
           try {
             await memory.resumePendingWork({ deferDerivation: true, threadId: String(session.id) })
             const contexts = memory.getBlockContext(String(session.id))
-            this.syncDecayedBlockSurface(session, contexts)
+            if (this.syncDecayedBlockSurface(session, memory, contexts)) {
+              await this.flushNativeSession(session)
+            }
           } finally {
             await this.persistSuccessfulResponses(memory)
           }
@@ -1650,14 +1923,14 @@ export class StrataGateRuntime {
   async searchGraph(session: Session, query: string, limit = 8): Promise<unknown> {
     await this.flush()
     const results = await (await this.space(session)).searchGraphNodes(query, limit)
-    return this.batch(session, results.map(({ node }) => ({
+    return this.batch(session, results.map(({ node, provenanceEventIds }) => ({
       ref: `graph-node:${node.id}`,
       target: {
-        eventIds: node.sourceEventIds,
+        eventIds: (provenanceEventIds ?? []).slice(0, GRAPH_PROVENANCE_LIMIT),
         elementIds: [],
         citation: citation('graph', node.id, node.name, `graph-node:${node.id}`, 'nodeId'),
       },
-    })), results.map(({ node, score, matchedFields, matchReason }) => compactGraphNode(node, score, matchedFields, matchReason)))
+    })), results.map(compactGraphNode))
   }
 
   async expandGraphNode(session: Session, id: string): Promise<unknown> {
@@ -1665,21 +1938,48 @@ export class StrataGateRuntime {
     const memory = await this.space(session)
     const node = memory.listGraphNodes().find((candidate) => candidate.id === id)
     if (!node) throw new Error(`Unknown graph node: ${id}`)
-    const edges = memory.listGraphEdges().filter(({ fromNodeId, toNodeId }) => fromNodeId === id || toNodeId === id)
+    const view = effectiveGraphNodeView(node, memory.listGraphEdges(), memory.listAllEvents())
+    if (!view) throw new Error(`Graph node ${id} has no retrievable Event evidence`)
+    const provenanceEventIds = [...new Set([
+      ...view.currentFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...view.currentEdges.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...view.historicalFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...view.historicalEdges.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...view.currentNodeEventIds,
+      ...view.historicalNodeEventIds,
+    ])].slice(0, GRAPH_PROVENANCE_LIMIT)
+    const legacyMetadataOverflow = !view.node.metadataProvenance && view.node.sourceEventIds.length > GRAPH_PROVENANCE_LIMIT
+    const boundedView = boundEffectiveGraphNodeView(view, new Set(provenanceEventIds), {
+      preserveLegacyMetadata: legacyMetadataOverflow,
+    })
+    const currentFacts = boundedView.currentFacts
+    const historicalFacts = boundedView.historicalFacts
+    const currentEdges = boundedView.currentEdges
+    const historicalEdges = boundedView.historicalEdges
     return this.batch(session, [{
       ref: `graph-node:${node.id}:expanded`,
       target: {
-        eventIds: [...new Set([...node.sourceEventIds, ...edges.flatMap(({ sourceEventIds }) => sourceEventIds)])],
+        eventIds: provenanceEventIds,
         elementIds: [],
-        citation: citation('graph', node.id, node.name, `graph-node:${node.id}:expanded`, 'nodeId', { expanded: true }),
+        citation: citation('graph', node.id, boundedView.node.name, `graph-node:${node.id}:expanded`, 'nodeId', { expanded: true }),
       },
-    }], { node, edges })
+    }], {
+      node: boundedView.node,
+      edges: [...currentEdges, ...historicalEdges],
+      currentFacts,
+      historicalFacts,
+      currentEdges,
+      historicalEdges,
+      provenanceEventIds,
+      ...(legacyMetadataOverflow ? { metadataEvidenceStatus: 'not_expanded' as const } : {}),
+      timeline: graphTimeline(provenanceEventIds, memory.listAllEvents()),
+    })
   }
 
   private scheduleBlockDerivation(session: Session, memory: StrataGate): void {
     const threadId = String(session.id)
     const key = `${this.namespaceFor(session)}\u0000${threadId}`
-    if (this.closed || this.derivationTimers.has(key) || this.derivationRuns.has(key)) return
+    if (this.closed || !this.models.isReady(session) || this.derivationTimers.has(key) || this.derivationRuns.has(key)) return
     const pendingBlockIds = new Set(memory.listBlocks()
       .filter((block) => block.threadId === threadId && block.processingStatus === 'pending')
       .map((block) => block.id))
@@ -1695,21 +1995,28 @@ export class StrataGateRuntime {
     const delay = Math.max(0, Math.min(...retryTimes) - Date.now())
     const timer = setTimeout(() => {
       this.derivationTimers.delete(key)
-      if (this.closed) return
+      if (this.closed || !this.models.isReady(session)) return
       const failedBefore = this.failedCoreJobs(memory)
       const run = this.models.run(session, () => memory.resumePendingWork({ threadId }))
         .then(async (resumed) => {
           await this.persistSuccessfulResponses(memory)
           this.noteNewCoreJobFailures(session, failedBefore, memory)
           const contexts = memory.getBlockContext(threadId)
+          let changed = false
           for (const block of resumed.readyBlocks) {
             if (block.threadId !== threadId) continue
             const context = contexts.find(({ id }) => id === block.id)
             if (!context) throw new Error(`Missing context for ready StrataGate block ${block.id}`)
-            this.replaceSealedSurface(session, block, context, dshTurnAtBlockEnd(session, block))
+            if (hostCompactionActive(session)) {
+              this.pendingSurfaceSync.set(`${this.namespaceFor(session)}\u0000${block.id}`, {
+                namespace: this.namespaceFor(session), blockId: block.id,
+              })
+              continue
+            }
+            changed = this.replaceSealedSurface(session, block, context, dshTurnAtBlockEnd(session, block)) || changed
           }
-          const changed = this.syncDecayedBlockSurface(session, contexts)
-          if (resumed.readyBlocks.length > 0 || changed) await this.flushNativeSession(session)
+          changed = this.syncDecayedBlockSurface(session, memory, contexts) || changed
+          if (changed) await this.flushNativeSession(session)
         })
         .catch((error: unknown) => {
           this.notePluginError(session, error)
@@ -1727,26 +2034,31 @@ export class StrataGateRuntime {
 
   private scheduleGraphMigration(session: Session, memory: StrataGate): void {
     const namespace = this.namespaceFor(session)
-    if (this.closed || this.migrationTimers.has(namespace)) return
+    if (this.closed || !this.models.isReady(session) || this.migrationTimers.has(namespace) || this.migrationRuns.has(namespace)) return
     if (typeof memory.listGraphProjectionJobs !== 'function') return
     const pending = memory.listGraphProjectionJobs().some((job) => graphProjectionCanRun(job))
     if (!pending) return
     const timer = setTimeout(() => {
       this.migrationTimers.delete(namespace)
-      if (this.closed) return
+      if (this.closed || !this.models.isReady(session)) return
       const failedBefore = this.failedCoreJobs(memory)
       const completedBefore = memory.listGraphProjectionJobs().filter(({ status }) => status === 'completed').length
-      void this.models.run(session, () => memory.resumePendingWork()).then(async () => {
+      let madeProgress = false
+      const run = this.models.run(session, () => memory.resumePendingWork()).then(async () => {
         await this.persistSuccessfulResponses(memory)
         this.noteNewCoreJobFailures(session, failedBefore, memory)
         const completedAfter = memory.listGraphProjectionJobs().filter(({ status }) => status === 'completed').length
-        // Continue only after durable progress. A failed batch waits for the
-        // next normal plugin wake-up instead of causing a retry/token storm.
-        if (completedAfter > completedBefore) this.scheduleGraphMigration(session, memory)
+        madeProgress = completedAfter > completedBefore
       }).catch((error: unknown) => {
         this.notePluginError(session, error)
         this.onIngestError(error)
+      }).finally(() => {
+        if (this.migrationRuns.get(namespace) === run) this.migrationRuns.delete(namespace)
+        // Continue only after durable progress. A failed batch waits for the
+        // next normal plugin wake-up instead of causing a retry/token storm.
+        if (madeProgress) this.scheduleGraphMigration(session, memory)
       })
+      this.migrationRuns.set(namespace, run)
     }, 1_500)
     timer.unref?.()
     this.migrationTimers.set(namespace, timer)
@@ -1906,8 +2218,11 @@ function renderContent(content: readonly ContentBlock[]): string {
       output.push(block.text.trim())
     } else if (block.type === 'image') {
       output.push('[image]')
-    } else if (block.type === 'tool-result' && Array.isArray(block.content)) {
-      output.push(renderContent(block.content))
+    } else {
+      const legacy = block as { type: string; content?: readonly ContentBlock[] }
+      if (legacy.type === 'tool-result' && Array.isArray(legacy.content)) {
+        output.push(renderContent(legacy.content))
+      }
     }
   }
   return output.filter(Boolean).join('\n')
@@ -1931,20 +2246,19 @@ function renderMessages(messages: readonly RawMessage[]): string {
   }).join('\n\n')
 }
 
-function dshTurnAtBlockEnd(session: Session, block: MemoryBlock): number {
+function dshTurnAtBlockEnd(session: Session, block: MemoryBlock): number | null {
   const blockEnd = Date.parse(block.createdAt)
   const events = session.snapshotEvents()
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
     if (event?.type === 'turn/end' && event.time === blockEnd) return event.data.turn
   }
-  throw new Error(`Cannot match StrataGate block ${block.id} to its completed DSH turn`)
+  return null
 }
 
-function sealedSurfaceSeqs(session: Session, endTurn: number, turnCount: number): SessionSeq[] {
+function sealedSurfaceSeqs(session: Session, endTurn: number, block: MemoryBlock): SessionSeq[] | null {
   const currentSurface = [...session.surface.nodes]
-  const currentSet = new Set(currentSurface)
-  const completed: Array<{ turn: number; start: SessionSeq; end: SessionSeq; nodes: SessionSeq[] }> = []
+  const completed: Array<{ turn: number; endTime: number; start: SessionSeq; end: SessionSeq; nodes: SessionSeq[] }> = []
   let open: { turn: number; start: SessionSeq } | undefined
   const events = session.snapshotEvents()
 
@@ -1960,39 +2274,175 @@ function sealedSurfaceSeqs(session: Session, endTurn: number, turnCount: number)
     if (hasHumanMessage && event.data.turn <= endTurn) {
       completed.push({
         turn: event.data.turn,
+        endTime: event.time,
         start: open.start,
         end: event.seq,
-        nodes: currentSurface.filter((seq) => seq > open!.start && seq < event.seq && currentSet.has(seq)),
+        nodes: currentSurface.filter((seq) => {
+          if (seq > open!.start && seq < event.seq) return true
+          const current = session.eventAt(seq)
+          return current?.type === 'tool/result'
+            && current.surfaceOp !== 'append'
+            && current.sourceEventSeqs?.some((source) => source > open!.start && source < event.seq)
+        }),
       })
     }
     open = undefined
   }
 
+  const sourceTimes = block.l5Raw.filter((message) => message.role === 'user')
+    .map((message) => Date.parse(message.createdAt))
+  const turnCount = block.endTurn - block.startTurn + 1
   const selected = completed.slice(-turnCount)
-  if (selected.length !== turnCount || selected.at(-1)?.turn !== endTurn) {
-    throw new Error(`Cannot identify ${turnCount} completed DSH turns ending at turn ${endTurn}`)
-  }
+  if (selected.length !== turnCount || selected.at(-1)?.turn !== endTurn
+    || sourceTimes.length !== turnCount
+    || selected.some((turn, index) => turn.endTime !== sourceTimes[index])) return null
+  const firstTurn = selected[0]!
+  const lastTurn = selected.at(-1)!
+  // A host checkpoint may consume only part of the block. Never turn a
+  // surviving fragment back into a complete old conversation.
+  if (events.some((event) => {
+    const hostEvent = event as { type: string; data: { shadowedSeqs?: readonly number[] } }
+    return hostEvent.type === 'compaction/summary'
+      && hostEvent.data.shadowedSeqs?.some((seq) => seq >= firstTurn.start && seq <= lastTurn.end)
+  })) return null
   const emptyTurn = selected.find((turn) => turn.nodes.length === 0)
-  if (emptyTurn) {
-    throw new Error(`Cannot compact DSH turn ${emptyTurn.turn}: its original messages are no longer on the surface`)
-  }
+  if (emptyTurn) return null
 
   const start = selected[0]!.nodes[0]!
   const end = selected.at(-1)!.nodes.at(-1)!
   const startIndex = currentSurface.indexOf(start)
   const endIndex = currentSurface.indexOf(end)
-  if (startIndex < 0 || endIndex < startIndex) {
-    throw new Error(`Cannot identify a contiguous DSH surface range ending at turn ${endTurn}`)
-  }
+  if (startIndex < 0 || endIndex < startIndex) return null
   return currentSurface.slice(startIndex, endIndex + 1)
+}
+
+function hostCompactionActive(session: Session): boolean {
+  // Match DSH's own lifecycle rule: a start from a previous restored seed
+  // cannot lock the new live session.
+  let lastBoundary: { type: string; seq: number } | undefined
+  let lastSeed: number | undefined
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq as SessionSeq)
+    if (!event) continue
+    if (lastSeed === undefined && event.type === 'session/end-seed') lastSeed = seq
+    if (!lastBoundary && (String(event.type) === 'compaction/start' || String(event.type) === 'compaction/end')) lastBoundary = event
+    if (lastSeed !== undefined && lastBoundary) break
+  }
+  return lastBoundary?.type === 'compaction/start'
+    && (lastSeed === undefined || lastBoundary.seq > lastSeed)
+}
+
+const SURFACE_MIN_SAVED_TOKENS = 32
+const SURFACE_MAX_REPLACEMENT_RATIO = 0.9
+// BasicCompaction's default recent tail is 16% of the routed context window
+// and its default summary cap is 8,192 tokens. An indivisible Block gets at
+// most a quarter of that tail and half of that summary cap. Use the latter
+// when the host has not logged the routed model capacity yet.
+const SURFACE_MAX_WINDOW_FRACTION = 0.04
+const SURFACE_CHECKPOINT_CEILING_TOKENS = 4_096
+
+function surfaceCheckpointLimit(session: Session): number {
+  const window = typeof session.requestContext === 'function'
+    ? session.requestContext()?.contextWindow
+    : undefined
+  return typeof window === 'number' && Number.isInteger(window) && window > 0
+    ? Math.max(1, Math.min(SURFACE_CHECKPOINT_CEILING_TOKENS, Math.floor(window * SURFACE_MAX_WINDOW_FRACTION)))
+    : SURFACE_CHECKPOINT_CEILING_TOKENS
+}
+
+function surfaceCheckpointTokens(text: string): number {
+  return estimateTokens(JSON.stringify(createUserMessage({
+    content: [{ type: 'text', text }],
+    source: dshMessageSource(),
+  })))
+}
+
+function originalCheckpointSourceTokens(session: Session, seq: SessionSeq): number | null {
+  const visited = new Set<SessionSeq>()
+  const visit = (sourceSeq: SessionSeq): number | null => {
+    if (visited.has(sourceSeq)) return null
+    visited.add(sourceSeq)
+    const event = session.eventAt(sourceSeq)
+    if (!event) return null
+    if (event.type === 'user/message'
+      && isStrataGateMessageSource(event.data.source)) {
+      const sources = event.sourceEventSeqs
+      if (!sources?.length) return null
+      let total = 0
+      for (const source of sources) {
+        const tokens = visit(source)
+        if (tokens === null) return null
+        total += tokens
+      }
+      return total
+    }
+    const message = session.deriveEventMessage(event)
+    return message ? estimateTokens(JSON.stringify(message)) : null
+  }
+  return visit(seq)
+}
+
+function worthwhileSurfaceReduction(before: number, after: number): boolean {
+  return before - after >= SURFACE_MIN_SAVED_TOKENS
+    && after <= before * SURFACE_MAX_REPLACEMENT_RATIO
+}
+
+function selectCompressedBlockSurfaceText(
+  currentText: string,
+  context: BlockContextEntry,
+  block: MemoryBlock,
+  highestLevel: BlockLevel,
+  sourceTokens: number | null,
+  checkpointLimit: number,
+): string | null {
+  const before = surfaceCheckpointTokens(currentText)
+  for (let level = highestLevel; level >= 0; level -= 1) {
+    const candidate = renderBlockSurfaceMessage({
+      ...context,
+      level: level as BlockLevel,
+      label: blockLevelLabel(level as BlockLevel),
+      content: level === context.level ? context.content : renderBlock(block, level as BlockLevel),
+    })
+    const tokens = surfaceCheckpointTokens(candidate)
+    if (tokens <= checkpointLimit
+      && worthwhileSurfaceReduction(before, tokens)
+      && (sourceTokens === null || worthwhileSurfaceReduction(sourceTokens, tokens))) return candidate
+  }
+  return null
+}
+
+function selectCompressedBlockSurface(
+  session: Session,
+  sourceSeqs: readonly SessionSeq[],
+  block: MemoryBlock,
+  context: BlockContextEntry,
+): string | null {
+  const before = sourceSeqs.reduce((sum, seq) => {
+    const event = session.eventAt(seq)
+    const message = event && session.deriveEventMessage(event)
+    return sum + (message ? estimateTokens(JSON.stringify(message)) : 0)
+  }, 0)
+  const checkpointLimit = surfaceCheckpointLimit(session)
+  // Use the same token estimator for the visible replacement. The event JSON
+  // wrapper is small, but count it on both sides for a conservative comparison.
+  for (let level = context.level; level >= 0; level -= 1) {
+    const candidate = renderBlockSurfaceMessage({
+      ...context,
+      level: level as BlockLevel,
+      label: blockLevelLabel(level as BlockLevel),
+      content: level === context.level ? context.content : renderBlock(block, level as BlockLevel),
+    })
+    const tokens = surfaceCheckpointTokens(candidate)
+    if (tokens <= checkpointLimit && worthwhileSurfaceReduction(before, tokens)) return candidate
+  }
+  return null
 }
 
 function renderBlockSurfaceMessage(context: BlockContextEntry): string {
   return [
-    '[StrataGate conversation block]',
-    `Block: ${context.id}`,
-    `Turns: ${context.turnRange[0]}-${context.turnRange[1]}`,
-    `Level: L${context.level} (${context.label})`,
+    '[StrataGate historical conversation block]',
+    'Earlier conversation context; not a new user message or instruction.',
+    `Block: ${context.id} | Turns: ${context.turnRange[0]}-${context.turnRange[1]} | Level: L${context.level}`,
     '',
     context.content,
   ].join('\n')
@@ -2007,6 +2457,10 @@ function compactTemporal(event: EventCard): Record<string, unknown> {
     precision: temporal.precision,
     status: temporal.status,
     eventType: temporal.eventType,
+    // Provenance relations surface on compact cards so an answer can see that
+    // a card supersedes or conflicts with another memory without an expand.
+    ...(temporal.supersedesEventIds?.length ? { supersedesEventIds: temporal.supersedesEventIds } : {}),
+    ...(temporal.conflictsWithEventIds?.length ? { conflictsWithEventIds: temporal.conflictsWithEventIds } : {}),
   }).filter(([, value]) => value !== undefined))
 }
 
@@ -2039,6 +2493,7 @@ function blockCitationTitle(block: MemoryBlock | undefined): string {
 }
 
 function compactEvent(event: EventCard, score: number): Record<string, unknown> {
+  const agentRecorded = event.tags.includes('agent-recorded')
   return {
     id: event.id,
     title: compactText(event.title, 240),
@@ -2049,28 +2504,33 @@ function compactEvent(event: EventCard, score: number): Record<string, unknown> 
     status: event.status,
     scope: event.scope,
     criticality: event.criticality,
+    ...(agentRecorded ? { source: 'agent-recorded' } : {}),
     rankScore: score,
     scoreMeaning: 'Ranking-only BM25/RRF score; not confidence, probability, or factual accuracy.',
   }
 }
 
-function compactGraphNode(
-  node: GraphNode,
-  score: number,
-  matchedFields?: readonly string[],
-  matchReason?: string,
-): Record<string, unknown> {
+function compactGraphNode(result: GraphNodeSearchResult): Record<string, unknown> {
+  const { node, score, matchedFields, matchReason } = result
   return {
     id: node.id,
     name: node.name,
     type: node.type,
     aliases: node.aliases.map((alias) => compactText(alias, 160)),
+    ...(node.tags ? { tags: node.tags.map((tag) => compactText(tag, 120)) } : {}),
     currentState: compactText(node.currentState, 500),
     status: node.status,
     rankScore: score,
     ...(matchedFields ? { matchedFields } : {}),
     ...(matchReason ? { matchReason } : {}),
+    ...(result.metadataEvidenceStatus ? { metadataEvidenceStatus: result.metadataEvidenceStatus } : {}),
     scoreMeaning: 'Ranking-only BM25/RRF score; not confidence, probability, or factual accuracy.',
+    ...(result.matchType ? { matchType: result.matchType } : {}),
+    ...(result.currentFacts ? { currentMatches: result.currentFacts } : {}),
+    ...(result.historicalFacts ? { historicalMatches: result.historicalFacts } : {}),
+    ...(result.currentEdges ? { currentRelations: result.currentEdges } : {}),
+    ...(result.historicalEdges ? { historicalRelations: result.historicalEdges } : {}),
+    ...(result.timeline ? { timeline: result.timeline } : {}),
   }
 }
 
@@ -2099,12 +2559,12 @@ function currentBlockSurfaceMessages(session: Session): Map<string, { seq: Sessi
   for (const seq of session.surface.nodes) {
     const event = session.eventAt(seq)
     if (event?.type !== 'user/message'
-      || event.data.source.kind !== 'plugin'
-      || event.data.source.plugin !== COMPACTION_SOURCE_PLUGIN) continue
+      || !isStrataGateMessageSource(event.data.source)) continue
     const text = event.data.content
       .flatMap((block) => block.type === 'text' ? [block.text] : [])
       .join('\n')
-    const blockId = text.match(/^\[StrataGate conversation block\]\nBlock: ([^\n]+)/u)?.[1]
+    const blockId = text.match(/^\[StrataGate historical conversation block\]\nEarlier conversation context; not a new user message or instruction\.\nBlock: ([^|\n]+) \| Turns:/u)?.[1]?.trim()
+      ?? text.match(/^\[StrataGate conversation block\]\nBlock: ([^\n]+)/u)?.[1]
       ?? text.match(/^\[StrataGate compressed conversation\]\nBlock ([^;\n]+);/u)?.[1]
     if (blockId) blocks.set(blockId, { seq, text })
   }
@@ -2113,7 +2573,7 @@ function currentBlockSurfaceMessages(session: Session): Map<string, { seq: Sessi
 
 function activatedEvents(memory: StrataGate, relevance: readonly EventSearchResult[]): EventCard[] {
   const allowed = new Map(relevance.map(({ event }) => [event.id, event]))
-  for (const event of memory.listEvents()) {
+  for (const event of memory.listAllEvents()) {
     if ((event.status === 'active' || event.status === 'superseded')
       && (event.weight.pinned || event.criticality === 'safety')) {
       allowed.set(event.id, event)
@@ -2129,7 +2589,7 @@ function activatedEvents(memory: StrataGate, relevance: readonly EventSearchResu
 
 function activatedElements(memory: StrataGate, relevance: readonly ElementSearchResult[]): RankedElementFact[] {
   const elements = new Map(memory.listElements().map((element) => [element.id, element]))
-  const safetyEvents = new Set(memory.listEvents()
+  const safetyEvents = new Set(memory.listAllEvents()
     .filter((event) => event.criticality === 'safety' && (event.status === 'active' || event.status === 'superseded'))
     .map(({ id }) => id))
   const allowed = new Map<string, RankedElementFact>()
@@ -2165,7 +2625,10 @@ function activatedElements(memory: StrataGate, relevance: readonly ElementSearch
   ]).map(({ item }) => item)
 }
 
-function renderActivatedMemory(events: readonly EventCard[], graphNodes: readonly GraphNode[]): string {
+function renderActivatedMemory(
+  events: readonly EventCard[],
+  graphResults: readonly GraphNodeSearchResult[],
+): string {
   const heading = [
     '[Activated long-term memory]',
     'Historical memory context.',
@@ -2194,13 +2657,23 @@ function renderActivatedMemory(events: readonly EventCard[], graphNodes: readonl
     eventCount += 1
   }
 
-  for (const node of graphNodes) {
+  for (const result of graphResults) {
+    const node = result.node
     const rendered = JSON.stringify({
       nodeId: node.id,
       name: node.name,
       type: node.type,
+      aliases: node.aliases,
+      tags: node.tags,
+      status: node.status,
+      metadataEvidenceStatus: result.metadataEvidenceStatus,
+      matchType: result.matchType,
       currentState: node.currentState,
-      facts: node.facts.filter(({ status }) => status === 'active').map(({ key, value, validFrom, validTo }) => ({ key, value, validFrom, validTo })),
+      facts: node.facts.map(({ key, value, status, validFrom, validTo }) => ({ key, value, status, validFrom, validTo })),
+      currentRelations: result.currentEdges?.map(({ relation, status }) => ({ relation, status })),
+      historicalMatches: result.historicalFacts?.map(({ key, value, status, validFrom, validTo }) => ({ key, value, status, validFrom, validTo })),
+      historicalRelations: result.historicalEdges?.map(({ relation, status, validFrom, validTo }) => ({ relation, status, validFrom, validTo })),
+      timeline: result.timeline,
     })
     const cost = estimateTokens(`\nKnowledgeGraph:\n- ${rendered}`)
     if (tokens + cost > AUTO_MEMORY_TOKEN_BUDGET) break

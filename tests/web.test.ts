@@ -8,7 +8,7 @@ import { handleAdminRequest, type WebResponse } from '../src/web.js'
 const fullFailure = 'StrataGate model response was not valid JSON\nRaw response (full):\n' + 'x'.repeat(600)
 
 const snapshot: StrataGateSnapshot = {
-  schemaVersion: 11,
+  schemaVersion: 12,
   currentTurn: 8,
   blockTurnSize: 4,
   blockDecayLambda: 0.3,
@@ -61,6 +61,7 @@ const snapshot: StrataGateSnapshot = {
     createdAt: '2026-08-18T00:00:00.000Z',
     updatedAt: '2026-08-18T00:00:00.000Z',
   }],
+  agentEvents: [],
   graphNodes: [{
     id: 'node_1', name: 'pnpm', type: 'tool', aliases: [], currentState: '项目包管理器', facts: [],
     status: 'active', confidence: 0.95, sourceEventIds: ['evt_1'],
@@ -118,6 +119,7 @@ const snapshot: StrataGateSnapshot = {
 
 let updatedLambda: number | null = null
 let updatedTurnSize: number | null = null
+let updatedAgentWeight: number | null = null
 let expandedBlock: { namespace: string; id: string; target: string | number } | null = null
 const runtime = {
   adminNamespaces: async () => ['dsh:project:test'],
@@ -125,12 +127,17 @@ const runtime = {
   adminSnapshotEntries: async () => [{ namespace: 'dsh:project:test', revision: 7, snapshot }],
   adminDataDirectory: () => 'C:\\Users\\tester\\.dsh\\stratagate',
   adminWorkspaceName: () => 'StrataGate',
+  adminAgentMemoryRetrievalWeight: () => 1,
   adminSetBlockTurnSize: async (value: number) => {
     updatedTurnSize = value
     return value
   },
   adminSetBlockDecayLambda: async (value: number) => {
     updatedLambda = value
+    return value
+  },
+  adminSetAgentMemoryRetrievalWeight: (value: number) => {
+    updatedAgentWeight = value
     return value
   },
   adminExpandBlock: async (namespace: string, id: string, target: string | number) => {
@@ -206,6 +213,29 @@ describe('StrataGate admin routes', () => {
       title: 'Edited title',
       bodyMarkdown: '## 问题描述\n\nEdited locally.',
     } }])
+  })
+
+  it('lists agent-recorded memories through a read-only route', async () => {
+    const calls: Array<unknown> = []
+    const agentRuntime = {
+      adminAgentMemories: async (options: unknown) => {
+        calls.push(options)
+        return {
+          items: [{ id: 'evt_1', sessionId: 's1', content: '用户偏好 pnpm。', status: 'active', weight: 1 }],
+          total: 1,
+        }
+      },
+    } as unknown as StrataGateRuntime
+    const result = await request('/api/stratagate/agent-memories?session=s1&includeArchived=true', 'GET', agentRuntime)
+    expect(result).toMatchObject({ status: 200, body: { total: 1, items: [{ id: 'evt_1', status: 'active' }] } })
+    const filtered = await request('/api/stratagate/agent-memories', 'GET', agentRuntime)
+    expect(filtered.status).toBe(200)
+    expect(calls[0]).toEqual({ sessionId: 's1', includeArchived: true })
+    expect(calls[1]).toEqual({})
+    const rejected = await request('/api/stratagate/agent-memories', 'POST', agentRuntime, { sessionId: 's1' })
+    expect(rejected.status).toBe(405)
+    const unknown = await request('/api/stratagate/agent-memories-extra', 'GET', agentRuntime)
+    expect(unknown.status).toBe(404)
   })
 
   it('supports preview, commit, and undo through the import route', async () => {
@@ -1142,6 +1172,32 @@ describe('StrataGate admin routes', () => {
     })
   })
 
+  it('filters forgotten Graph metadata and Events from citation source details', async () => {
+    const forgottenEvent = {
+      ...snapshot.events[0]!, id: 'evt_forgotten_graph_detail', title: 'Forgotten source', summary: 'Forgotten alias secret',
+      status: 'forgotten' as const,
+    }
+    const safeRuntime = {
+      adminSnapshot: async () => ({
+        ...snapshot,
+        events: [...snapshot.events, forgottenEvent],
+        graphNodes: [{
+          ...snapshot.graphNodes[0]!, name: 'pnpm', aliases: ['forgotten-secret-alias'],
+          metadataProvenance: {
+            name: ['evt_1'],
+            aliases: [{ value: 'forgotten-secret-alias', sourceEventIds: [forgottenEvent.id] }],
+          },
+          sourceEventIds: ['evt_1', forgottenEvent.id],
+        }],
+      }),
+    } as unknown as StrataGateRuntime
+    const result = await request('/api/stratagate/sources?namespace=graph-safe&nodeId=node_1', 'GET', safeRuntime)
+    expect(result.body.node).toMatchObject({ name: 'pnpm', aliases: [] })
+    expect(result.body.events.map(({ id }: { id: string }) => id)).toEqual(['evt_1'])
+    expect(JSON.stringify(result.body)).not.toContain('forgotten-secret-alias')
+    expect(JSON.stringify(result.body)).not.toContain('Forgotten alias secret')
+  })
+
   it('expands a block into its organized events and elements', async () => {
     const result = await request('/api/stratagate/sources?namespace=dsh%3Aproject%3Atest&blockId=blk_1')
     expect(result.body).toMatchObject({
@@ -1190,17 +1246,52 @@ describe('StrataGate admin routes', () => {
   it('updates the global Block settings while memory routes remain read-only', async () => {
     updatedLambda = null
     updatedTurnSize = null
-    const settings = await request('/api/stratagate/settings?blockTurnSize=3&blockDecayLambda=0.15', 'PATCH')
-    expect(settings).toMatchObject({ status: 200, body: { blockTurnSize: 3, blockDecayLambda: 0.15 } })
+    updatedAgentWeight = null
+    const settings = await request('/api/stratagate/settings?blockTurnSize=3&blockDecayLambda=0.15&agentMemoryRetrievalWeight=2.5', 'PATCH')
+    expect(settings).toMatchObject({ status: 200, body: { blockTurnSize: 3, blockDecayLambda: 0.15, agentMemoryRetrievalWeight: 2.5 } })
     expect(updatedTurnSize).toBe(3)
     expect(updatedLambda).toBe(0.15)
+    expect(updatedAgentWeight).toBe(2.5)
 
     const invalid = await request('/api/stratagate/settings?blockDecayLambda=nope', 'PATCH')
     expect(invalid).toMatchObject({ status: 400, body: { error: expect.stringContaining('blockDecayLambda') } })
     const invalidTurnSize = await request('/api/stratagate/settings?blockTurnSize=2.5', 'PATCH')
     expect(invalidTurnSize).toMatchObject({ status: 400, body: { error: expect.stringContaining('blockTurnSize') } })
+    const invalidWeight = await request('/api/stratagate/settings?agentMemoryRetrievalWeight=9', 'PATCH')
+    expect(invalidWeight).toMatchObject({ status: 400, body: { error: expect.stringContaining('agentMemoryRetrievalWeight') } })
 
     const result = await request('/api/stratagate/memories', 'POST')
     expect(result).toMatchObject({ status: 405, body: { error: expect.stringContaining('read-only') } })
+  })
+
+  it('reads and updates one shared Profile field from Settings', async () => {
+    const profile = { preferredLanguage: '' }
+    let revision = 0
+    const calls: unknown[] = []
+    const profileRuntime = {
+      getProfileSnapshot: () => ({ profile, revisions: { preferredLanguage: revision } }),
+      updatePersistentProfile: (field: string, value: string, source: string, _sourceMessageId: unknown, expectedValue: string, expectedRevision: number) => {
+        calls.push({ field, value, source, expectedValue, expectedRevision })
+        if (profile.preferredLanguage !== expectedValue || revision !== expectedRevision) return { field, value: profile.preferredLanguage, modified: false, conflict: true }
+        profile.preferredLanguage = value
+        revision++
+        return { field, value, modified: true }
+      },
+    } as unknown as StrataGateRuntime
+    expect(await request('/api/stratagate/profile', 'GET', profileRuntime)).toMatchObject({ status: 200, body: { preferredLanguage: '', _revisions: { preferredLanguage: 0 } } })
+    expect(await request('/api/stratagate/profile', 'PATCH', profileRuntime, { field: 'preferredLanguage', value: '中文', expectedValue: '', expectedRevision: 0 }))
+      .toMatchObject({ status: 200, body: { field: 'preferredLanguage', value: '中文', modified: true } })
+    expect(calls).toEqual([{ field: 'preferredLanguage', value: '中文', source: 'settings', expectedValue: '', expectedRevision: 0 }])
+    expect(await request('/api/stratagate/profile', 'GET', profileRuntime)).toMatchObject({ body: { preferredLanguage: '中文' } })
+    const literal = 'Use password: abc as an example; token=demo stays literal.'
+    expect(await request('/api/stratagate/profile', 'PATCH', profileRuntime, { field: 'preferredLanguage', value: literal, expectedValue: '中文', expectedRevision: 1 }))
+      .toMatchObject({ body: { value: literal } })
+    expect(await request('/api/stratagate/profile', 'GET', profileRuntime)).toMatchObject({ body: { preferredLanguage: literal } })
+    expect(await request('/api/stratagate/profile', 'PATCH', profileRuntime, { field: 'preferredLanguage', value: `${literal} More.`, expectedValue: literal, expectedRevision: 2 }))
+      .toMatchObject({ body: { value: `${literal} More.` } })
+    expect(await request('/api/stratagate/profile', 'PATCH', profileRuntime, { field: 'preferredLanguage', value: 'stale draft', expectedValue: literal, expectedRevision: 2 }))
+      .toMatchObject({ status: 409, body: { error: '该项刚刚在其他位置更新' } })
+    expect(profile.preferredLanguage).toBe(`${literal} More.`)
+    expect((await request('/api/stratagate/profile', 'PATCH', profileRuntime, { field: 'preferredLanguage', value: '中文', other: true })).status).toBe(400)
   })
 })

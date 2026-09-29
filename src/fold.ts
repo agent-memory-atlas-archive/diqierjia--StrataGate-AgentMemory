@@ -31,13 +31,16 @@ function renderBlocks(blocks: readonly ContentBlock[]): string {
         break
       case 'tool-call':
         break
-      case 'tool-result': {
-        const nested = renderBlocks(block.content)
-        if (nested) output.push(nested)
+      default: {
+        // V3 tool results could be nested content blocks. V4 uses a tool-role
+        // message, but old records may still pass through this reader.
+        const legacy = block as { type: string; content?: readonly ContentBlock[] }
+        if (legacy.type === 'tool-result' && legacy.content) {
+          const nested = renderBlocks(legacy.content)
+          if (nested) output.push(nested)
+        }
         break
       }
-      default:
-        break
     }
   }
   return output.join('\n').trim()
@@ -95,6 +98,9 @@ export class TurnFolder {
         return null
       }
       case 'tool/result': {
+        // DSH prune emits a second tool/result for the model-visible surface.
+        // The first append is the execution evidence kept in L5.
+        if (event.surfaceOp && event.surfaceOp !== 'append') return null
         const callId = String(event.data.message.source.callId)
         const pending = this.pending(sessionId, event.data.turn)
         if (pending.ignoredTools.has(callId)) return null

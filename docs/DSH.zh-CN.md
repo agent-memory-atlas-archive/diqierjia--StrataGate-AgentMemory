@@ -81,13 +81,24 @@ DSH_HOME/stratagate/memory.db
 - 每个 DSH 对话轮次都有持久化的写入回执，因此重放或重试不会导致重复保存。
 - StrataGate 会执行 Block 摘要、Event 提取、版本化 Knowledge Graph 投影、搜索、Evidence Gate（证据门控）以及仅在使用后触发的强化。
 - Block 到达边界时，StrataGate 先持久化真实的 L3–L5，不修改 DSH surface。只有 L0–L2 校验通过且 Event 处理完成、Block 进入可衰减状态后，插件才使用原生 surface `replace`；待处理或失败的 Block 始终保留原始会话消息。后续衰减、手动提升或 λ 调整也只更新已就绪 checkpoint。尚未封存的 open tail 与完整工具调用/结果链继续作为 DSH 原生消息保留。
-- 每次主模型调用前，动态系统上下文只注入最多 4 条项目级激活 Event 和 4 个 active Graph Node，不再序列化 Current conversation、open tail、已封 Block 或 tool calls。
+- 每次主模型调用前，独立的常驻画像上下文无需检索就注入非空的全局字段。动态记忆上下文另注入最多 4 条项目级激活 Event 和 4 个 active Graph Node，不会把当前对话、open tail、已封 Block 或工具调用序列化进该上下文。
 
 激活查询由当前人类消息和当前会话 open tail 的最近两个 turn 组成。现有 BM25 搜索继续作为词面相关性门槛，只有 pinned 和 safety 记忆可以例外进入候选；现有记忆权重提供第二路排序，再由 RRF 融合相关性与权重排序。激活区固定使用约 900 tokens 的预算，不会随数据库增大而增长。
 
 自动上下文只包含来自其他会话的精简 Event 与 fact 字段，并明确标注为历史背景而非指令。当前会话 Block 的证据会被排除，因为每个 Block 当前衰减层级的表示已存在于 DSH 原生历史中。构建自动上下文不会调用 `recordMemoryUse`，不会增加 `mentionCount`，也不会更新 `lastAdoptedTurn`。现有 `memory_*` 工具仍用于更深入、经过 Evidence Gate 的主动检索，也是触发采用强化的唯一入口。
 
 每次主动检索都会创建独立批次。模型先把该批次的 `batch_id` 传给 `memory_assess`，再用 `memory_record_use` 结算同一批次。模型需要传入回答中实际使用且属于该批次的 `evidence_refs`；若一条也没有使用，则传入 `[]`。被选中的 Event 证据会强化一次，空数组会写入一条包含真实批次 ID 的零强化回执。
+
+### Agent 主动记忆
+
+选用写入工具时看信息的适用范围：`memory_profile_update` 修改每次对话都自动提供的全局常驻画像字段；`memory_remember` 保存只需在相关情境中想起的 Event，例如项目专属偏好和已做出的决定；仅本次有效的要求不写入记忆。“记住”一词本身不决定用哪个工具，同一信息默认只写入一处。主动提出修改画像仍须遵守该工具的“同意”规则。
+
+`memory_remember` 让 agent 主动记录值得记忆的事实：适用于特定情境的用户偏好、事实纠正、决定和持久的项目事实。记录会进入与对话派生记忆相同的长期 Event 管线，但有两点不同：
+
+- **隔离存储。** agent 记录的 Event 存放在专属的 `agent_events` 隔离表中，数据模型与普通 Event 完全一致，但与被动对话表物理分离。其溯源直接引用**记录会话中的真实对话消息** —— 优先取 open tail 中的 user/assistant 消息，其次取该会话最新封存 Block 的消息 —— 绝不生成虚构的 user 消息。仅当会话中没有任何已摄取消息时，才会创建合成的 `agent-memory:` 溯源 Block。
+- **写入前消解。** 写入前，StrataGate 会先在两个池中检索重复与冲突：精确或高度近似的重复会强化既有卡片而不新写；词面重叠模糊的记录会触发一次同步模型仲裁，复用外部记忆导入的决策契约 —— `ADD`、`MERGE`、`SUPERSEDE`（仅高置信度；低置信度的合并/取代会降级为非破坏性的冲突标记）、`CONFLICT`（双向回链）或 `IGNORE`。工具结果会回报 `action`、`gate` 与 `reason`。与既有记忆没有实质重叠的事实直接写入，不调用模型。
+
+其余行为与普通 Event 一致：agent 记录会投影进 Knowledge Graph，跨会话持久保存，走同样的 turn 衰减与引用强化生命周期（`memory_assess` → `memory_record_use`），也可以通过该生命周期遗忘。检索为两个池各开一条独立的 top-k 通道 —— 被动池与 agent 池分别独立排序，再按加权 RRF 融合，任何一方都无法把另一方挤出结果窗口。agent 通道的占比由 `agentMemoryRetrievalWeight` 配置（默认 `1` = 平权；`0` = 记录保留但不再浮现；更大值提升 agent 记录的排序权重），卡片带 `source: 'agent-recorded'` 标记。记忆面板通过 `/api/stratagate/agent-memories`（查询参数 `session` 与 `includeArchived=true`）展示这些记录。可用 `agentMemoryEnabled: false` 整体关闭该功能，同时注销对应工具。
 
 插件注册以下工具：
 
@@ -96,7 +107,8 @@ memory_search_events   memory_expand_event
 memory_search_graph    memory_expand_graph_node
 memory_search_raw      memory_get_blocks
 memory_expand_block    memory_assess
-memory_record_use
+memory_record_use      memory_remember
+memory_profile_update
 ```
 
 `memory_get_blocks` 支持 `scope=session`（默认值，保留历史上的当前会话隔离语义）和
@@ -128,7 +140,9 @@ ID、`blockId`、角色、轮次和有界摘录。`narrative`、`quotes`、来�
 - 手动展开 Block，以及分两步导入其他 AI 的记忆；
 - Usage Audit（使用审计）链路：从已记录的回答轮次出发，经由 Evidence Gate 的判断与选中的记忆，追溯到来源消息。
 
-界面不允许直接编辑、删除或批准 Event、图谱事实和来源消息，但可以通过三种明确操作改变记忆状态：手动展开 Block、导入其他 AI 的记忆，以及在“高级设置”中修改每个 Block 包含的完整对话轮数或全局 Block 衰减系数 λ。修改轮数时，界面会解释两者关系并给出保持单位对话衰减速度的建议 λ，是否采用由用户决定。保存后设置立即应用到所有已有工作区，同时成为新工作区默认值，并在重启后保持；已封存 Block 不会重新切分。
+界面不允许直接编辑、删除或批准 Event、图谱事实和来源消息。用户可以手动展开 Block、导入其他 AI 的记忆，以及在“高级设置”中修改每个 Block 包含的完整对话轮数或全局 Block 衰减系数 λ。修改轮数时，界面会解释两者关系并给出保持单位对话衰减速度的建议 λ，是否采用由用户决定。保存后设置立即应用到所有已有工作区，同时成为新工作区默认值，并在重启后保持；已封存 Block 不会重新切分。
+
+顶部“常驻画像”页面可编辑固定的九项字段。页面按身份与语言、交互偏好、关于用户、其他分组，默认紧凑显示；编辑时只展开一个字段。“默认回答语言”仅用于最终回复，“思考过程语言”仅用于宿主界面向用户展示的 reasoning/thinking 文本（若支持），两项互不推导；后者为空时不额外要求思考语言，也不控制隐藏的内部推理。页面可见时约每 5 秒读取最新画像，隐藏或离开时停止，并保留正在编辑的草稿。同一字段被其他来源修改时会提示冲突，保存不会覆盖新值。Settings 与 `memory_profile_update` 修改同一份安装级画像，跨会话、跨命名空间生效；保存后下一次模型调用立即看到新值，空字段不注入。字段按 Unicode 码点计数，上限依次为 100、100、100、100、1000、1000、1500、1000、1200 字符，总预算 6000 字符；总容量 4800 字符触发后台整理。SQLite 会记录 Settings、工具及后台整理的每次变更、旧值和来源。后台整理在首次写入非空画像或上次成功整理满 24 小时后，或达到容量阈值时执行；只读取当前画像，只压缩表达，不新增事实，也不语义改写四个短字段。Event 提取和 Graph 投影都不会写入画像。
 
 当前界面会在写入前校验并预览粘贴的 `stratagate.external-memory.v2` JSON：不合格内容会进入模型兜底恢复，恢复候选全部需要人工确认。完全重复项会被确定性忽略，其余候选由当前模型结合 Top-K 本地 Event 判断新增、合并、取代、冲突或忽略。分析任务和逐条进度持久化到 SQLite，关闭并重新打开页面后会恢复进度；高置信度判断自动采用，低置信度项可由用户选择具体动作；提交后可按批次撤销。消息内容和结构化工具轨迹中的常见令牌及凭证格式，会在离开本地服务器前被脱敏。SQLite 数据库始终是唯一可信数据源。
 
@@ -143,6 +157,8 @@ config:
   blockTurnSize: 6
   blockDecayLambda: 0.3
   ingestSubagents: false
+  agentMemoryEnabled: true
+  agentMemoryRetrievalWeight: 1
   maxOutputTokens: 10000
   structuredTaskTimeoutMs: 120000
   structuredReasoningEffort: auto # auto | force-off
@@ -159,6 +175,8 @@ config:
 
 `blockDecayLambda` 按当前 Block 锚点与同一 DSH 会话中最新已封存 Block 的距离控制衰减。默认值为 `0.3`；数字越小衰减越慢，不建议大于 `0.4`。open tail 中尚未封存的轮次不会增加 Block age。
 
+`agentMemoryEnabled`（默认 `true`）控制 Agent 主动记忆（见上文）；关闭后同时注销 `memory_remember`。`agentMemoryRetrievalWeight`（默认 `1`，范围 `0`–`5`）设置 agent 通道在融合检索中的占比。记录与其他 StrataGate 数据一样保存在同一个 SQLite 数据库中。
+
 如果省略 `provider` 和 `model`，记忆处理会优先使用会话最近一次请求的路由，并以 DSH 默认模型作为后备。这两个配置项必须同时设置。
 
 ## 隐私与故障处理
@@ -169,9 +187,11 @@ config:
 
 ## 兼容性与权限
 
-发布门禁会在 Node `24`、Linux 和 Windows 上测试完整的 DSH `0.1.2-rc.1` 依赖族、`@deepseek-ai/dsh@0.1.5-rc.1` 和 `@deepseek-ai/dsh@0.1.6-alpha.1`。0.1.5 CLI 的真实依赖树会把内部 DSH 包解析为 `0.1.5-rc.2`；0.1.6 CLI 的受测内部 DSH 与 Session Format 包均解析为 `0.1.6-alpha.1`。插件将这些包声明为可选且精确版本的 peer，由宿主提供一套一致的运行时，避免 npm 在插件目录再安装第二套核心包；不会笼统承诺其他 `0.1.x` 版本。
+发布门禁会在 Node `24`、Linux 和 Windows 上测试完整的 DSH `0.1.2-rc.1` 依赖族，以及 `@deepseek-ai/dsh@0.1.5-rc.1`、`@deepseek-ai/dsh@0.1.6-alpha.1`、`@deepseek-ai/dsh@0.1.7-rc.1` 和 `@deepseek-ai/dsh@0.1.7-rc.2`。0.1.5 CLI 的真实依赖树会把内部 DSH 包解析为 `0.1.5-rc.2`；0.1.6 和 0.1.7 CLI 的受测内部 DSH 与 Session Format 包分别解析为对应版本。0.1.7 宿主还提供 Cordis `4.0.4` 和 Schemastery `3.18.4`。插件将 DSH `0.1.7` 内部包的可选 peer 范围放宽到 `>=0.1.7-rc.1 <0.1.8-0`，启动时仍要求它们全部来自同一版本，并限制 Cordis 与 Schemastery 在已知的小版本补丁范围内。未来 `0.1.7` 更新可直接安装，但发布门禁只覆盖上面列出的版本；更新后仍应运行兼容性检查。不包含 `0.1.8`。
 
-DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于 DSH `0.1.5` 和 `0.1.6`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
+DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于 DSH `0.1.5` 至 `0.1.7`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
+
+DSH 0.1.7 将插件配置保存在 profile 中，并通过配置表单提供实时控制。StrataGate 聊天界面中的设置在 0.1.7 使用配置表单，在之前受支持的宿主上继续使用旧设置服务。调整结构化任务的推理力度后，后续记忆模型调用会直接使用新值，无需重启插件。
 
 DSH 0.1.6 的官方 DeepSeek profile 默认可能启用 Session Log 请求元数据，因此宿主可能把原始 Session Event 放入 `dsh_session_log` 请求字段。该元数据不属于模型 messages、system prompt 或 tool schema，不能据此判断 StrataGate 压缩失效。StrataGate 不会修改这一 DSH 全局设置；需要关闭的用户应通过 DSH 配置设置 `session-log-deepseek.enabled=false`。
 

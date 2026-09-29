@@ -25,8 +25,10 @@ import type {
   SuccessfulModelResponse,
   SuccessfulModelResponseKind,
 } from '@diqier/stratagate'
-import { EXTERNAL_MEMORY_DECIDER_PROMPT_ZH_CN, nowUtc8, parseExternalMemoryExport } from '@diqier/stratagate'
+import { buildMemoryDerivationMessages, EXTERNAL_MEMORY_DECIDER_PROMPT_ZH_CN, nowUtc8, parseExternalMemoryExport } from '@diqier/stratagate'
+import { PROFILE_FIELDS, PROFILE_PROTECTED_SHORT_FIELDS, validateProfile, type PersistentProfile } from '@diqier/stratagate'
 import type { ResolvedConfig, StructuredReasoningEffortMode } from './config.js'
+import { dshMessageSource } from './dsh-compatibility.js'
 import { ModelJsonResponseError, parseJsonResponse } from './json-response.js'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 
@@ -59,7 +61,14 @@ function l2Neighbor(block: MemoryBlock | null): Record<string, unknown> | null {
 
 function extractorPayload(context: ExtractionContext): Record<string, unknown> {
   return {
-    target: context.target,
+    target: {
+      blockId: context.target.id,
+      sequence: context.target.sequence,
+      startTurn: context.target.startTurn,
+      endTurn: context.target.endTurn,
+      createdAt: context.target.createdAt,
+      messages: buildMemoryDerivationMessages(context.target.l5Raw),
+    },
     neighbors: {
       previous: l2Neighbor(context.previous),
       next: l2Neighbor(context.next),
@@ -79,17 +88,33 @@ const STRUCTURED_FIELDS = {
   graphProjector: ['reason', 'nodes', 'edges'],
   externalMemoryExtractor: ['reason', 'candidates'],
   externalMemoryDecider: ['action', 'reason', 'confidence'],
+  profileMaintenance: Object.keys(PROFILE_FIELDS),
 } as const
 const STRING_ARRAY: ValueSchemaSpec = { type: 'array', items: { type: 'string' } }
 const OPEN_OBJECT: ValueSchemaSpec = { type: 'object', additionalProperties: true }
 
 const SUMMARIZER_PARAMETERS: ParameterSchemaSpec = {
-  l0Title: { type: 'string', required: true },
-  l0Tags: { ...STRING_ARRAY, required: true },
-  l1Summary: { type: 'string', required: true },
-  l2Keypoints: { ...STRING_ARRAY, required: true },
-  shouldExtract: { type: 'boolean', required: true },
+  l0Title: { type: 'string', description: 'L0: a short phrase naming the Block\'s central subject for quick recognition; do not turn it into a sentence-length summary.', required: true },
+  l0Tags: { ...STRING_ARRAY, description: 'L0: a few distinctive topical labels (usually 2-5) for rapid recognition of the Block, such as named people, projects, organizations, tools, technical topics, or specific task concepts; omit generic labels such as discussion, conversation, problem, or task.', required: true },
+  l1Summary: { type: 'string', description: 'L1: a compact, self-contained overview of what happened across the Block, its conclusions or results, significant state changes, and key unresolved work; richer than L0 but still quick to read.', required: true },
+  l2Keypoints: { ...STRING_ARRAY, description: 'L2: specific, self-contained points needed to recover context later. Make each point mostly atomic: one decision, constraint, preference, fact, result, failure reason, or open item. Add detail beyond L1 without splitting or repeating its sentences.', required: true },
+  shouldExtract: { type: 'boolean', description: 'High-recall pre-screen for Event extraction, not the final Event decision. True when this Block clearly contains or may reasonably contain a long-term Event; when uncertain, use true so the Event Extractor can decide. False only when it clearly lacks lasting value, such as greetings, repeated confirmations, or disposable process noise. Mere presence of a fact is not sufficient.', required: true },
 }
+
+const SUMMARIZER_SYSTEM_PROMPT = `You are the Block Summarizer in StrataGate's memory pipeline. Compress one sealed conversation Block, typically about six turns, from the supplied provenance-preserving derivation messages into L0-L2 layered memory and decide whether it warrants later Event extraction. You are a background model, not the main Agent; you have no other conversation context. L5 retains the complete original source, while L3/L4 are produced separately. Your L0-L2 may later replace detailed chat in the Agent's context, so preserve what future work needs without inventing missing context.
+
+L0 -> L1 -> L2 are progressively higher-resolution views of the same history, not three independent or repetitive summaries:
+- L0: l0Title is a short subject phrase for rapid recognition, ideally under about 60 characters; l0Tags are a few distinctive topical labels for rapid recognition, usually 2-5. Prefer named people, projects, organizations, tools, technical topics, and specific task concepts. Avoid generic tags such as discussion, conversation, problem, or task.
+- L1: l1Summary is a compact, self-contained overview of the whole Block: what happened, conclusions or results, meaningful state changes, and key unresolved work. Usually 1-3 sentences; do not retell the conversation turn by turn.
+- L2: l2Keypoints retain concrete details needed to resume work. Usually 3-8 concise points when there is enough substance, fewer for a thin Block. Each point should stand alone and express mainly one decision, constraint, preference, fact, result, significant failure reason, or open item. Be more specific than L1; do not merely split L1 into repeated sentences.
+
+Prioritize important decisions, constraints, user preferences, final outcomes, significant failure causes, and unresolved work; then task-relevant process details. Omit repetition, greetings, and disposable execution noise. Do not discard a constraint or conclusion that would change how later work is understood just to shorten the output.
+
+Keep provenance and uncertainty. Distinguish what the user stated or decided, what the assistant only proposed or suspected, and what a tool actually observed. Do not promote an assistant hypothesis or a recollection of older memory into a verified fact or new outcome. Preserve uncertainty about timing, causes, status, results, and relationships. Ordinary user/assistant text is retained, but large tool arguments or results may be compacted; use only retained tool names, evidence summaries, and excerpts, and never guess omitted payload details.
+
+shouldExtract is a high-recall pre-screen, not the final Event decision. If it is false, Event extraction is skipped entirely; if true, the Event Extractor makes the final evidence-based decision. Set true when this Block clearly contains or may reasonably contain a long-term Event, such as a decision, stable preference, material project change, meaningful task result, important failure and possible cause, future-useful fact, or open item worth tracking. When uncertain whether a plausible candidate has lasting value, choose true and let the Event Extractor decide. Set false only when the Block clearly lacks such value, for example greetings, repeated confirmations, or disposable execution noise. Do not set true merely because some fact appears; an unsupported assistant suggestion or recap of older memory alone does not establish a new Event candidate.
+
+Call stratagate_summarize_block exactly once with l0Title, l0Tags, l1Summary, l2Keypoints, and shouldExtract. Do not return the summary as ordinary text.`
 
 const EVENT_ITEM: ValueSchemaSpec = {
   type: 'object',
@@ -156,12 +181,27 @@ const GRAPH_FACT: ValueSchemaSpec = {
   properties: { key: { type: 'string', required: true }, value: { ...VALUE, required: true }, sourceEventIds: { ...STRING_ARRAY, required: true } },
 }
 
+const GRAPH_METADATA_ENTRY: ValueSchemaSpec = {
+  type: 'object', additionalProperties: false,
+  properties: { value: { type: 'string', required: true }, sourceEventIds: { ...STRING_ARRAY, required: true } },
+}
+
+const GRAPH_METADATA_PROVENANCE: ValueSchemaSpec = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    name: { ...STRING_ARRAY, required: true },
+    aliases: { type: 'array', items: GRAPH_METADATA_ENTRY },
+    tags: { type: 'array', items: GRAPH_METADATA_ENTRY },
+  },
+}
+
 const GRAPH_NODE: ValueSchemaSpec = {
   type: 'object', additionalProperties: false,
   properties: {
     ref: { type: 'string', required: true }, name: { type: 'string', required: true },
     type: { type: 'string', enum: ['person', 'project', 'organization', 'tool', 'place'], required: true },
-    aliases: STRING_ARRAY, tags: { ...STRING_ARRAY, required: true }, state: { type: 'string' }, facts: { type: 'array', items: GRAPH_FACT },
+    aliases: STRING_ARRAY, tags: { ...STRING_ARRAY, required: true }, metadataProvenance: { ...GRAPH_METADATA_PROVENANCE, required: true },
+    state: { type: 'string' }, facts: { type: 'array', items: GRAPH_FACT },
     status: { type: 'string', enum: ['active', 'superseded', 'disputed', 'archived'] },
     validFrom: { type: 'string' }, validTo: { type: 'string' }, confidence: { type: 'number' },
     sourceEventIds: { ...STRING_ARRAY, required: true },
@@ -198,10 +238,14 @@ const EXTERNAL_MEMORY_EXTRACTOR_PARAMETERS: ParameterSchemaSpec = {
   candidates: { type: 'array', items: OPEN_OBJECT, required: true },
 }
 
+const PROFILE_MAINTENANCE_PARAMETERS = Object.fromEntries(
+  Object.keys(PROFILE_FIELDS).map((field) => [field, { type: 'string', required: true }]),
+) as ParameterSchemaSpec
+
 const STRUCTURED_TOOLS = {
   summarizer: {
     name: 'stratagate_summarize_block',
-    description: 'Submit the completed durable summary for the supplied conversation block.',
+    description: 'Submit the L0-L2 layered compression of one sealed StrataGate conversation Block and decide whether it should proceed to Event extraction.',
     parameters: SUMMARIZER_PARAMETERS,
   },
   extractor: {
@@ -228,6 +272,11 @@ const STRUCTURED_TOOLS = {
     name: 'stratagate_recover_external_memory',
     description: 'Recover structured external-memory candidates from malformed JSON or plain text.',
     parameters: EXTERNAL_MEMORY_EXTRACTOR_PARAMETERS,
+  },
+  profileMaintenance: {
+    name: 'stratagate_maintain_profile',
+    description: 'Return the same nine Persistent Profile fields with only safe wording and redundancy cleanup; preserve the four short fields apart from necessary whitespace cleanup.',
+    parameters: PROFILE_MAINTENANCE_PARAMETERS,
   },
 } as const
 
@@ -282,6 +331,7 @@ function compactGraphProjectionContext(context: GraphProjectionContext): unknown
       type: node.type,
       aliases: node.aliases.slice(0, 12),
       tags: node.tags?.slice(0, 12),
+      metadataProvenance: node.metadataProvenance,
       currentState: node.currentState.slice(0, 600),
       facts: node.facts
         .filter(({ status }) => status === 'active' || status === 'disputed')
@@ -310,17 +360,40 @@ export class DshModelBridge {
   private readonly successfulResponses: SuccessfulModelResponse[] = []
   private readonly offCapabilities = new Map<string, 'supported' | 'unsupported'>()
   private readonly warnedOffFallbackRoutes = new Set<string>()
+  private readonly adaptersUpdatedListeners = new Set<() => void>()
   private structuredReasoningEffort: StructuredReasoningEffortMode
 
-  constructor(private readonly ctx: Context, private readonly config: ResolvedConfig) {
+  constructor(private readonly ctx: Context, private readonly config: ResolvedConfig,
+    private readonly liveStructuredReasoningEffort?: () => StructuredReasoningEffortMode) {
     this.structuredReasoningEffort = config.structuredReasoningEffort ?? 'auto'
     this.ctx.on?.('llm/adapters-updated', () => {
       this.offCapabilities.clear()
+      for (const listener of this.adaptersUpdatedListeners) listener()
     })
+  }
+
+  /** True only when the exact provider route has a registered DSH adapter. */
+  isReady(session?: Session): boolean {
+    try {
+      const { provider } = this.resolveRoute(session)
+      return this.ctx.llm.listProviders().some(({ id }) => id === provider)
+    } catch {
+      return false
+    }
+  }
+
+  /** Wake durable workers when DSH changes the adapter registry. */
+  onAdaptersUpdated(listener: () => void): () => void {
+    this.adaptersUpdatedListeners.add(listener)
+    return () => { this.adaptersUpdatedListeners.delete(listener) }
   }
 
   setStructuredReasoningEffort(mode: StructuredReasoningEffortMode): void {
     this.structuredReasoningEffort = mode
+  }
+
+  private currentStructuredReasoningEffort(): StructuredReasoningEffortMode {
+    return this.liveStructuredReasoningEffort?.() ?? this.structuredReasoningEffort
   }
 
   run<T>(session: Session, operation: () => Promise<T>): Promise<T> {
@@ -338,8 +411,8 @@ export class DshModelBridge {
 
   readonly summarizer: BlockSummarizer = async (messages) => {
     const raw = object(await this.callStructured('summarizer',
-      `You compress agent conversations into durable memory blocks. Read the supplied messages and call ${STRUCTURED_TOOLS.summarizer.name} exactly once with l0Title, l0Tags, l1Summary, l2Keypoints, and shouldExtract. Preserve decisions, constraints, preferences, outcomes, and unresolved work. shouldExtract is true only when durable events or facts exist. Do not return the summary as text.`,
-      { messages },
+      SUMMARIZER_SYSTEM_PROMPT,
+      { messages: buildMemoryDerivationMessages(messages) },
     ))
     return {
       l0Title: text(raw.l0Title).slice(0, 120),
@@ -353,7 +426,7 @@ export class DshModelBridge {
   readonly extractor: EventExtractor = async (context: ExtractionContext) => {
     const validMessageIds = new Set(context.target.l5Raw.map((message) => message.id))
     const raw = object(await this.callStructured('extractor',
-      `Extract only durable, evidence-backed events from target.l5Raw, then call ${STRUCTURED_TOOLS.extractor.name} exactly once. The target block is the only legal source of new facts, quotations, and sourceMessageIds. neighbors.previous and neighbors.next are context-only L2 summaries; never extract from them. Every sourceMessageIds entry must exactly match allowedSourceMessageIds. If a fact appears only in a neighbor, do not extract it in this call. Events must be understandable later without the original chat. Use project scope for repository decisions, user scope for stable preferences/identity, and session scope for temporary task state. temporal.eventType must use exactly one stable value: decision, release, task_completed, plan, change, cancellation, incident, meeting, collaboration, migration, or other. temporal.participants contains canonical entity names. Use ISO-8601 timestamps with the explicit +08:00 offset in temporal fields. Keep happened time separate from mentionedAt; when happened time is unknown omit it and set precision/basis to unknown. Do not turn an assistant statement that merely recalls older memory into a new event; require new human input or a new observable task/tool outcome from target.l5Raw. Do not return the result as text.`,
+      `Extract only durable, evidence-backed events from target.messages, then call ${STRUCTURED_TOOLS.extractor.name} exactly once. target.messages is a provenance-preserving derivation view of the target block: message ids and conversational text are retained, while tool code and oversized tool payloads may be marked compacted. Use the retained tool names, evidence summaries, and excerpts without inventing omitted details. The target block is the only legal source of new facts, quotations, and sourceMessageIds. neighbors.previous and neighbors.next are context-only L2 summaries; never extract from them. Every sourceMessageIds entry must exactly match allowedSourceMessageIds. If a fact appears only in a neighbor, do not extract it in this call. Events must be understandable later without the original chat. Use project scope for repository decisions, user scope for stable preferences/identity, and session scope for temporary task state. temporal.eventType must use exactly one stable value: decision, release, task_completed, plan, change, cancellation, incident, meeting, collaboration, migration, or other. temporal.participants contains canonical entity names. Use ISO-8601 timestamps with the explicit +08:00 offset in temporal fields. Keep happened time separate from mentionedAt; when happened time is unknown omit it and set precision/basis to unknown. Do not turn an assistant statement that merely recalls older memory into a new event; require new human input or a new observable task/tool outcome from target.messages. Do not return the result as text.`,
       extractorPayload(context),
     ))
     const events = (Array.isArray(raw.events) ? raw.events : []).map((candidate): EventCardInput | null => {
@@ -421,7 +494,7 @@ export class DshModelBridge {
   readonly graphProjector: GraphProjector = async (context: GraphProjectionContext): Promise<GraphProjectionResult> => {
     const eventIds = new Set(context.events.map((event) => event.id))
     const raw = object(await this.callStructured('graphProjector',
-      `Project the supplied Events into the current Knowledge Graph, then call ${STRUCTURED_TOOLS.graphProjector.name} exactly once. Events are the sole source of truth; never use legacy Element data. Return only nodes and edges touched by the supplied Events; never echo unchanged historical graph records. Return at most 24 nodes and 32 edges. Use stable entity nodes for people, projects, organizations, tools, and places. Use aliases to merge spelling/case/separator variants. Give every returned node 1-6 concise semantic role tags such as benchmark, evaluation, memory-plugin, parser, or development-tool; tags describe the node's specific role and never replace its person/project/organization/tool/place type. Reuse stable tag wording when possible. Put attributes in node facts and every relationship in a directed edge using fromRef/toRef—never encode a relationship as a fact string. Prefer concise canonical Chinese relation labels such as 使用、属于、创建、参与、贡献、依赖、位于、相关. Every node, fact, and edge must cite only supplied Event ids. Do not return text.`,
+      `Project the supplied Events into the current Knowledge Graph, then call ${STRUCTURED_TOOLS.graphProjector.name} exactly once. Events are the sole source of truth; never use legacy Element data. Return only nodes and edges touched by the supplied Events; never echo unchanged historical graph records. Return at most 24 nodes and 32 edges. Use stable entity nodes for people, projects, organizations, tools, and places. Use aliases to merge spelling/case/separator variants. Give every returned node 1-6 concise semantic role tags such as benchmark, evaluation, memory-plugin, parser, or development-tool; tags describe the node's specific role and never replace its person/project/organization/tool/place type. Reuse stable tag wording when possible. For every node name, alias, and tag, include metadataProvenance with the exact supplied Event ids that support that individual value; never use an unrelated active Event as a substitute. Put attributes in node facts and every relationship in a directed edge using fromRef/toRef—never encode a relationship as a fact string. Prefer concise canonical Chinese relation labels such as 使用、属于、创建、参与、贡献、依赖、位于、相关. Every node, fact, edge, and metadata provenance id must cite only supplied Event ids. Do not return text.`,
       compactGraphProjectionContext(context),
     ))
     const nodes = (Array.isArray(raw.nodes) ? raw.nodes : []).flatMap((candidate) => {
@@ -437,8 +510,27 @@ export class DshModelBridge {
         if (sourceEventIds.length === 0) return []
         return [{ key: text(fact.key), value, sourceEventIds }]
       })
+      const rawMetadata = object(item.metadataProvenance)
+      const metadataEntries = (value: unknown) => (Array.isArray(value) ? value : []).flatMap((candidate) => {
+        const entry = object(candidate)
+        const value = text(entry.value)
+        const sourceEventIds = strings(entry.sourceEventIds).filter((id) => eventIds.has(id))
+        return value && sourceEventIds.length > 0 ? [{ value, sourceEventIds }] : []
+      })
+      const metadataName = strings(rawMetadata.name).filter((id) => eventIds.has(id))
+      if (metadataName.length === 0) {
+        throw new Error(`Graph projection validation failed: node "${text(item.ref)}" name "${text(item.name)}" lacks valid metadata provenance.`)
+      }
+      const metadataAliases = metadataEntries(rawMetadata.aliases)
+      const metadataTags = metadataEntries(rawMetadata.tags)
+      const metadataProvenance = {
+        ...(metadataName.length > 0 ? { name: metadataName } : {}),
+        ...(metadataAliases.length > 0 ? { aliases: metadataAliases } : {}),
+        ...(metadataTags.length > 0 ? { tags: metadataTags } : {}),
+      }
       return [{
         ref: text(item.ref), name: text(item.name), type, aliases: strings(item.aliases), tags: strings(item.tags).slice(0, 12),
+        ...(Object.keys(metadataProvenance).length > 0 ? { metadataProvenance } : {}),
         ...(text(item.state) ? { state: text(item.state) } : {}), facts,
         ...(typeof item.status === 'string' ? { status: item.status as 'active' } : {}),
         ...(text(item.validFrom) ? { validFrom: text(item.validFrom) } : {}),
@@ -498,6 +590,22 @@ export class DshModelBridge {
     return { candidates: parsed.candidates, reason: text(raw.reason, parsed.reason) }
   }
 
+  async maintainProfile(profile: PersistentProfile): Promise<PersistentProfile> {
+    const raw = object(await this.callStructured('profileMaintenance',
+      `You maintain only the supplied StrataGate Persistent Profile. Call ${STRUCTURED_TOOLS.profileMaintenance.name} exactly once with all nine string fields. You may deduplicate, merge repeated meaning, shorten redundant wording, and improve organization. Preserve every unique fact, uncertainty, constraint, and instruction. Never infer or add facts, broaden meaning, or read Event, Graph, or conversation history. If two statements might conflict or cannot safely merge, retain both. Keep userPreferredName, assistantPreferredName, preferredLanguage, and reasoningLanguage unchanged except necessary whitespace cleanup. preferredLanguage and reasoningLanguage are independent: never infer, copy, or merge either language field into the other. reasoningLanguage is only for user-visible reasoning/thinking text when supported, not hidden chain-of-thought. Character limits (Unicode code points): ${JSON.stringify(Object.fromEntries(Object.entries(PROFILE_FIELDS).map(([field, spec]) => [field, spec.maxLength])))}. Total maximum: 6000. If safe compression is impossible, return the original value.`,
+      { profile, fieldDefinitions: PROFILE_FIELDS },
+    ))
+    if (Object.keys(raw).length !== Object.keys(PROFILE_FIELDS).length || Object.keys(raw).some((field) => !(field in PROFILE_FIELDS))) {
+      throw new Error('Profile maintenance returned unexpected fields')
+    }
+    const proposed = raw as PersistentProfile
+    validateProfile(proposed)
+    for (const field of PROFILE_PROTECTED_SHORT_FIELDS) {
+      if (proposed[field].trim() !== profile[field].trim()) throw new Error(`Profile maintenance changed protected short field ${field}`)
+    }
+    return proposed
+  }
+
   private async callStructured(kind: SuccessfulModelResponseKind, system: string, payload: unknown): Promise<unknown> {
     const execution = this.sessions.getStore()
     if (!execution) throw new Error('StrataGate model callback ran without an execution context')
@@ -510,11 +618,12 @@ export class DshModelBridge {
     let lastError: ModelJsonResponseError | undefined
     let lastResponse = ''
     let attemptsUsed = 0
+    let noAdapterRetried = false
     for (let attempt = 1; attempt <= JSON_RESPONSE_ATTEMPTS; attempt += 1) {
       attemptsUsed = attempt
       const message = createUserMessage({
         content: [{ type: 'text', text: JSON.stringify(payload) }],
-        source: { kind: 'plugin', plugin: 'stratagate-memory' },
+        source: dshMessageSource(),
       })
       const assembler = new BlockAssembler()
       const request: Parameters<typeof this.ctx.llm.stream>[0] & StructuredModelRequest = {
@@ -531,13 +640,20 @@ export class DshModelBridge {
           type: 'function',
           function: { name: STRUCTURED_TOOLS[kind].name },
         },
-        maxTokens: this.config.maxOutputTokens,
+        maxTokens: kind === 'profileMaintenance'
+          ? Math.max(this.config.maxOutputTokens, Math.min(12_000, 512 + 2 * Array.from(JSON.stringify(payload)).length))
+          : this.config.maxOutputTokens,
         sessionId: execution.sessionId,
         purpose: 'compaction',
       }
       try {
         await this.consumeStructuredStream(request, assembler)
       } catch (error) {
+        if (!noAdapterRetried && isNoAdapter(error)) {
+          noAdapterRetried = true
+          attempt -= 1
+          continue
+        }
         if (useOff && isOffRejection(error)) {
           this.offCapabilities.set(routeKey, 'unsupported')
           useOff = false
@@ -550,6 +666,11 @@ export class DshModelBridge {
       const finish = assembler.finish
       if (finish.kind === 'error' || finish.kind === 'aborted') {
         const failure = new Error(`StrataGate model call failed [${finish.failure.code}]: ${finish.failure.message}`)
+        if (!noAdapterRetried && isNoAdapter(finish.failure)) {
+          noAdapterRetried = true
+          attempt -= 1
+          continue
+        }
         if (useOff && isOffRejection(finish.failure)) {
           this.offCapabilities.set(routeKey, 'unsupported')
           useOff = false
@@ -606,13 +727,15 @@ export class DshModelBridge {
             )
           }
         }
-        this.successfulResponses.push({
-          id: `model_response_${crypto.randomUUID()}`,
-          kind,
-          response: responseForError,
-          createdAt: nowUtc8(),
-        })
-        if (this.successfulResponses.length > 5) this.successfulResponses.shift()
+        if (kind !== 'profileMaintenance') {
+          this.successfulResponses.push({
+            id: `model_response_${crypto.randomUUID()}`,
+            kind,
+            response: responseForError,
+            createdAt: nowUtc8(),
+          })
+          if (this.successfulResponses.length > 5) this.successfulResponses.shift()
+        }
         return parsed
       } catch (error) {
         if (!(error instanceof ModelJsonResponseError)) throw error
@@ -628,8 +751,9 @@ export class DshModelBridge {
         }
       }
     }
+    const validationDetail = lastError?.message ? `: ${lastError.message}` : ''
     throw new ModelJsonResponseError(
-      `StrataGate model did not produce a valid ${STRUCTURED_TOOLS[kind].name} call after ${attemptsUsed} attempt${attemptsUsed === 1 ? '' : 's'}`,
+      `StrataGate model did not produce a valid ${STRUCTURED_TOOLS[kind].name} call after ${attemptsUsed} attempt${attemptsUsed === 1 ? '' : 's'}${validationDetail}`,
       { cause: lastError, response: lastResponse },
     )
   }
@@ -638,14 +762,14 @@ export class DshModelBridge {
     const key = `${route.provider}\u0000${route.model}`
     const cached = this.offCapabilities.get(key)
     if (cached) {
-      if (cached === 'unsupported' && this.structuredReasoningEffort === 'force-off') {
+      if (cached === 'unsupported' && this.currentStructuredReasoningEffort() === 'force-off') {
         this.warnOffFallbackOnce(key, `${route.provider}/${route.model} does not support reasoningEffort=off; using the model default`)
       }
       return cached === 'supported'
     }
     if (typeof this.ctx.llm.resolveModelInfo !== 'function') {
       this.offCapabilities.set(key, 'unsupported')
-      if (this.structuredReasoningEffort === 'force-off') {
+      if (this.currentStructuredReasoningEffort() === 'force-off') {
         this.warnOffFallbackOnce(key, `${route.provider}/${route.model} capabilities are unavailable; using the model default`)
       }
       return false
@@ -664,16 +788,16 @@ export class DshModelBridge {
           timer.unref?.()
         }),
       ])
-      if (!info.reasoning) return this.structuredReasoningEffort === 'force-off'
+      if (!info.reasoning) return this.currentStructuredReasoningEffort() === 'force-off'
       const supported = info.reasoning.efforts.some(({ id }) => String(id) === 'off')
       this.offCapabilities.set(key, supported ? 'supported' : 'unsupported')
-      if (!supported && this.structuredReasoningEffort === 'force-off') {
+      if (!supported && this.currentStructuredReasoningEffort() === 'force-off') {
         this.warnOffFallbackOnce(key, `${route.provider}/${route.model} does not support reasoningEffort=off; using the model default`)
       }
       return supported
     } catch {
       this.offCapabilities.set(key, 'unsupported')
-      if (this.structuredReasoningEffort === 'force-off') {
+      if (this.currentStructuredReasoningEffort() === 'force-off') {
         this.warnOffFallbackOnce(key, `${route.provider}/${route.model} capability lookup failed; using the model default`)
       }
       return false
@@ -724,6 +848,18 @@ export class DshModelBridge {
     const fallback = this.ctx.agentDefaultModel.currentSelection()
     return { provider: fallback.provider, model: fallback.model }
   }
+}
+
+function isNoAdapter(error: unknown): boolean {
+  const seen = new Set<object>()
+  let current = error
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    const candidate = current as { code?: unknown; cause?: unknown }
+    if (candidate.code === 'NO_ADAPTER') return true
+    current = candidate.cause
+  }
+  return false
 }
 
 function isOffRejection(error: unknown): boolean {

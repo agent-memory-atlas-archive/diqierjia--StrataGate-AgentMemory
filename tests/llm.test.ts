@@ -4,6 +4,7 @@ import type { ExtractionContext, MemoryBlock } from '@diqier/stratagate'
 import { describe, expect, it, vi } from 'vitest'
 import { ModelJsonResponseError, parseJsonResponse } from '../src/json-response.js'
 import { DshModelBridge } from '../src/llm.js'
+import { emptyProfile } from '@diqier/stratagate'
 
 describe('DeepSeek Harness model JSON parsing', () => {
   it('extracts fenced JSON without being confused by braces in strings', () => {
@@ -104,6 +105,84 @@ function modelBridge(responses: Array<{ text?: string; tool?: unknown; toolName?
 }
 
 describe('DeepSeek Harness model JSON retries', () => {
+  it('sends maintenance only the current Profile and rejects added facts in protected fields', async () => {
+    const input = { ...emptyProfile(), preferredLanguage: '中文', reasoningLanguage: 'English', responsePreferences: '简洁。简洁。' }
+    const output = { ...input, responsePreferences: '简洁。' }
+    const { bridge, session, calls } = modelBridge([{ tool: output }])
+    expect(await bridge.run(session, () => bridge.maintainProfile(input))).toEqual(output)
+    const request = calls.mock.calls[0]![0] as { system: string; messages: Array<{ content: Array<{ text: string }> }> }
+    expect(request.system).toContain('Never infer or add facts')
+    expect(request.system).toContain('all nine string fields')
+    expect(request.system).toContain('never infer, copy, or merge either language field into the other')
+    expect(JSON.parse(request.messages[0]!.content[0]!.text)).toEqual({ profile: input, fieldDefinitions: expect.any(Object) })
+    expect(bridge.takeSuccessfulResponses()).toEqual([])
+    const invalid = modelBridge([{ tool: { ...input, userPreferredName: 'invented' } }, { tool: { ...input, userPreferredName: 'invented' } }])
+    await expect(invalid.bridge.run(invalid.session, () => invalid.bridge.maintainProfile(input))).rejects.toThrow(/protected short field/)
+    const copied = modelBridge([{ tool: { ...input, reasoningLanguage: '中文' } }, { tool: { ...input, reasoningLanguage: '中文' } }])
+    await expect(copied.bridge.run(copied.session, () => copied.bridge.maintainProfile(input))).rejects.toThrow(/protected short field reasoningLanguage/)
+    const inferred = modelBridge([{ tool: { ...input, preferredLanguage: 'English' } }, { tool: { ...input, preferredLanguage: 'English' } }])
+    await expect(inferred.bridge.run(inferred.session, () => inferred.bridge.maintainProfile(input))).rejects.toThrow(/protected short field preferredLanguage/)
+  })
+
+  it('reserves enough output for a full Chinese Profile and retries a truncated response', async () => {
+    const input = {
+      ...emptyProfile(), responsePreferences: '中'.repeat(1000), standingInstructions: '文'.repeat(1000),
+      userBackground: '背'.repeat(1500), longTermGoals: '目'.repeat(1000), persistentNotes: '注'.repeat(1200),
+    }
+    const { bridge, session, calls } = modelBridge([
+      { text: '{"partial":', finish: 'max-tokens' }, { tool: input },
+    ])
+    expect(await bridge.run(session, () => bridge.maintainProfile(input))).toEqual(input)
+    expect(calls).toHaveBeenCalledTimes(2)
+    expect(calls.mock.calls[0]![0].maxTokens).toBeGreaterThan(2048)
+  })
+
+  it('retries NO_ADAPTER once without spending a structured-response retry', async () => {
+    const calls = vi.fn()
+    const ctx = {
+      llm: { stream: (options: { tools: Array<{ name: string }> }) => {
+        calls(options)
+        if (calls.mock.calls.length === 1) {
+          throw Object.assign(new Error('no adapter registered'), { code: 'NO_ADAPTER' })
+        }
+        return (async function* () {
+          yield {
+            type: 'tool-call-delta' as const,
+            index: 0,
+            id: 'call' as never,
+            name: options.tools[0]!.name,
+            argumentsDelta: JSON.stringify({ l0Title: 'ready', l0Tags: [], l1Summary: 'ready', l2Keypoints: [], shouldExtract: false }),
+          }
+          yield { type: 'finish' as const, reason: { kind: 'stop' as const } }
+        })()
+      } },
+      logger: { warn: vi.fn() },
+    } as unknown as Context
+    const bridge = new DshModelBridge(ctx, {
+      database: ':memory:', namespaceMode: 'session', namespacePrefix: 'test', globalNamespace: 'global',
+      blockTurnSize: 1, blockDecayLambda: 0.3, ingestSubagents: false, maxOutputTokens: 256,
+    })
+    const session = { id: 'adapter-race', requestHeader: () => ({ config: { provider: 'test', model: 'test' } }) } as unknown as Session
+
+    await expect(bridge.run(session, () => bridge.summarizer([]))).resolves.toMatchObject({ l0Title: 'ready' })
+    expect(calls).toHaveBeenCalledTimes(2)
+  })
+
+  it('limits the NO_ADAPTER fallback to one retry', async () => {
+    const calls = vi.fn(() => {
+      throw Object.assign(new Error('no adapter registered'), { code: 'NO_ADAPTER' })
+    })
+    const ctx = { llm: { stream: calls }, logger: { warn: vi.fn() } } as unknown as Context
+    const bridge = new DshModelBridge(ctx, {
+      database: ':memory:', namespaceMode: 'session', namespacePrefix: 'test', globalNamespace: 'global',
+      blockTurnSize: 1, blockDecayLambda: 0.3, ingestSubagents: false, maxOutputTokens: 256,
+    })
+    const session = { id: 'adapter-missing', requestHeader: () => ({ config: { provider: 'test', model: 'test' } }) } as unknown as Session
+
+    await expect(bridge.run(session, () => bridge.summarizer([]))).rejects.toMatchObject({ code: 'NO_ADAPTER' })
+    expect(calls).toHaveBeenCalledTimes(2)
+  })
+
   it('returns an external-memory action with bounded confidence', async () => {
     const { bridge, session, calls } = modelBridge([{ tool: {
       action: 'SUPERSEDE', existingEventIds: ['evt_old'], reason: '同一事实的新状态', confidence: 1.4,
@@ -186,12 +265,93 @@ describe('DeepSeek Harness model JSON retries', () => {
     expect(calls.mock.calls[0]?.[0]).not.toHaveProperty('reasoningEffort')
   })
 
+  it('configures the Block Summarizer prompt and five described structured fields', async () => {
+    const { bridge, session, calls } = modelBridge([{
+      tool: { l0Title: 'Block topic', l0Tags: [], l1Summary: 'Block overview.', l2Keypoints: [], shouldExtract: false },
+    }])
+
+    await bridge.run(session, () => bridge.summarizer([]))
+
+    const request = calls.mock.calls[0]![0] as {
+      system: string
+      tools: Array<{ name: string; description: string; parameters: {
+        type: string; required: string[]; properties: Record<string, { type: string; description: string }>
+      } }>
+      tool_choice: unknown
+    }
+    expect(request.tools).toHaveLength(1)
+    expect(request.tools[0]).toMatchObject({
+      name: 'stratagate_summarize_block',
+      description: expect.stringContaining('L0-L2 layered compression'),
+    })
+    expect(request.tools[0]!.description).toContain('Event extraction')
+    expect(request.tool_choice).toEqual({ type: 'function', function: { name: 'stratagate_summarize_block' } })
+    const schema = request.tools[0]!.parameters
+    const fields = ['l0Title', 'l0Tags', 'l1Summary', 'l2Keypoints', 'shouldExtract']
+    expect(schema.type).toBe('object')
+    expect(Object.keys(schema.properties)).toEqual(fields)
+    expect(schema.required).toEqual(fields)
+    expect(fields.every((field) => schema.properties[field]!.description.length > 40)).toBe(true)
+    expect(schema.properties.l0Title!.type).toBe('string')
+    expect(schema.properties.l0Tags!.type).toBe('array')
+    expect(schema.properties.l0Tags!.description).toContain('topical labels')
+    expect(schema.properties.l0Tags!.description).toContain('rapid recognition')
+    expect(schema.properties.l0Tags!.description).not.toContain('retrieval')
+    expect(schema.properties.l1Summary!.type).toBe('string')
+    expect(schema.properties.l2Keypoints!.type).toBe('array')
+    expect(schema.properties.shouldExtract!.type).toBe('boolean')
+    expect(schema.properties.shouldExtract!.description).toContain('High-recall pre-screen')
+    expect(schema.properties.shouldExtract!.description).toContain('when uncertain, use true')
+    expect(schema.properties.shouldExtract!.description).toContain('False only when it clearly lacks lasting value')
+    expect(request.system).toContain("Block Summarizer in StrataGate's memory pipeline")
+    expect(request.system).toContain('progressively higher-resolution views of the same history')
+    expect(request.system).toContain('distinctive topical labels for rapid recognition')
+    expect(request.system).toContain('If it is false, Event extraction is skipped entirely')
+    expect(request.system).toContain('When uncertain whether a plausible candidate has lasting value, choose true')
+    expect(request.system).toContain('Set false only when the Block clearly lacks such value')
+    expect(request.system).toContain('what the assistant only proposed or suspected')
+    expect(request.system).toContain('never guess omitted payload details')
+    expect(request.system).toContain('Do not set true merely because some fact appears')
+    expect(request.system).toContain('Call stratagate_summarize_block exactly once')
+    expect(request.system).toContain('Do not return the summary as ordinary text')
+  })
+
+  it('summarizes from compact derivation messages instead of raw tool traces', async () => {
+    const code = 'const expensiveTrace = run();\n'.repeat(300)
+    const result = `BEGIN\n${'raw payload line\n'.repeat(500)}FINAL=success`
+    const messages = [{
+      id: 'msg_summary', role: 'assistant' as const, content: 'Verification completed successfully.',
+      createdAt: '2026-09-21T08:00:00.000Z',
+      toolCalls: [{ name: 'run_code', arguments: { code, cwd: '/workspace' }, result }],
+    }]
+    const { bridge, session, calls } = modelBridge([{
+      tool: { l0Title: 'verified', l0Tags: [], l1Summary: 'Verification passed.', l2Keypoints: [], shouldExtract: true },
+    }])
+
+    await bridge.run(session, () => bridge.summarizer(messages))
+
+    const payload = JSON.parse(String(calls.mock.calls[0]?.[0].messages?.[0]?.content?.[0]?.text)) as Record<string, any>
+    expect(payload.messages[0]).toMatchObject({ id: 'msg_summary', content: 'Verification completed successfully.' })
+    expect(payload.messages[0].toolCalls[0].name).toBe('run_code')
+    expect(payload.messages[0].toolCalls[0].arguments.cwd).toBe('/workspace')
+    expect(JSON.stringify(payload)).toContain('FINAL=success')
+    expect(JSON.stringify(payload)).not.toContain('expensiveTrace')
+    expect(JSON.stringify(payload).length).toBeLessThan(JSON.stringify({ messages }).length * 0.3)
+  })
+
   it('marks the target as the only source and limits neighbors to L2 context', async () => {
     const target = {
       id: 'blk_target', sequence: 2, startTurn: 3, endTurn: 4,
       l0Title: 'target', l0Tags: [], l1Summary: 'target summary', l2Keypoints: ['target point'],
       l3Condensed: 'target condensed', l4Readable: 'target readable',
-      l5Raw: [{ id: 'msg_target', role: 'user', content: 'target message', createdAt: '2026-01-01T00:00:00.000Z' }],
+      l5Raw: [{
+        id: 'msg_target', role: 'assistant', content: 'target message', createdAt: '2026-01-01T00:00:00.000Z',
+        toolCalls: [{
+          name: 'run_code',
+          arguments: { code: 'const rawSource = true;\n'.repeat(300), path: '/workspace/result.json' },
+          result: `decision evidence\n${'raw log\n'.repeat(500)}completed=true`,
+        }],
+      }],
       shouldExtract: true, processingStatus: 'ready', pointerCurrentLevel: 5, pointerAnchorLevel: 5,
       pointerAnchorBlockPosition: 1, lastLiftedAt: null, lastLiftedBy: null, createdAt: '2026-01-01T00:00:00.000Z',
     } as MemoryBlock
@@ -212,7 +372,13 @@ describe('DeepSeek Harness model JSON retries', () => {
     expect(result.shouldExtract).toBe(true)
     expect(result.events[0]?.sourceMessageIds).toEqual(['msg_target'])
     expect(payload.allowedSourceMessageIds).toEqual(['msg_target'])
-    expect(payload.target.l5Raw[0].id).toBe('msg_target')
+    expect(payload.target.messages[0].id).toBe('msg_target')
+    expect(payload.target.messages[0].toolCalls[0].name).toBe('run_code')
+    expect(payload.target.messages[0].toolCalls[0].arguments.path).toBe('/workspace/result.json')
+    expect(JSON.stringify(payload.target)).toContain('completed=true')
+    expect(JSON.stringify(payload.target)).not.toContain('rawSource')
+    expect(payload.target).not.toHaveProperty('l5Raw')
+    expect(payload.target).not.toHaveProperty('l4Readable')
     expect(payload.neighbors.next.l2Keypoints).toEqual(['next point'])
     expect(payload.neighbors.next.l5Raw).toBeUndefined()
   })
@@ -277,7 +443,15 @@ describe('DeepSeek Harness model JSON retries', () => {
     }
     const { bridge, session, calls } = modelBridge([{
       tool: { reason: 'projected', nodes: [{
-        ref: 'locomo', name: 'LoCoMo', type: 'project', tags: ['benchmark', 'evaluation'], sourceEventIds: [event.id],
+        ref: 'locomo', name: 'LoCoMo', type: 'project', tags: ['benchmark', 'evaluation'],
+        metadataProvenance: {
+          name: [event.id],
+          tags: [
+            { value: 'benchmark', sourceEventIds: [event.id] },
+            { value: 'evaluation', sourceEventIds: [event.id] },
+          ],
+        },
+        sourceEventIds: [event.id],
       }], edges: [] },
     }])
 
@@ -286,9 +460,30 @@ describe('DeepSeek Harness model JSON retries', () => {
     }))
 
     expect(result.nodes[0]?.tags).toEqual(['benchmark', 'evaluation'])
+    expect(result.nodes[0]?.metadataProvenance?.name).toEqual([event.id])
     expect(calls.mock.calls[0]?.[0].tools?.[0]?.name).toBe('stratagate_project_knowledge_graph')
     expect(calls.mock.calls[0]?.[0].tools?.[0]?.parameters?.properties?.nodes?.items?.required).toContain('tags')
+    expect(calls.mock.calls[0]?.[0].tools?.[0]?.parameters?.properties?.nodes?.items?.required).toContain('metadataProvenance')
+    expect(calls.mock.calls[0]?.[0].tools?.[0]?.parameters?.properties?.nodes?.items?.properties?.metadataProvenance?.required).toContain('name')
     expect(calls.mock.calls[0]?.[0].system).toContain('tags describe the node')
+  })
+
+  it('rejects a structured Graph node that omits canonical-name provenance', async () => {
+    const event = {
+      id: 'evt_graph_invalid', title: 'Invalid graph', summary: 'The model omitted field provenance.',
+      narrative: '', tags: [], quotes: [], sourceMessageIds: ['msg_graph_invalid'], sourceBlockId: 'blk_graph_invalid',
+      temporal: {}, scope: 'project' as const, criticality: 'routine' as const, confidence: 0.9,
+      status: 'active' as const, supersededBy: null,
+      weight: { mentionCount: 1, lastAdoptedTurn: 1, lastRetrievedAt: null, pinned: false, floorWeight: 0, forcedCap: null },
+      createdAt: '2026-09-20T00:00:00.000Z', updatedAt: '2026-09-20T00:00:00.000Z',
+    }
+    const invalid = {
+      tool: { reason: 'invalid', nodes: [{ ref: 'invalid', name: 'Invalid', type: 'project', tags: [], sourceEventIds: [event.id] }], edges: [] },
+    }
+    const { bridge, session } = modelBridge([invalid, invalid])
+    await expect(bridge.run(session, () => bridge.graphProjector({
+      jobId: 'gproj_invalid', projectorVersion: 1, events: [event], existingNodes: [], existingEdges: [],
+    }))).rejects.toThrow(/metadataProvenance/i)
   })
 
   it('compacts historical Graph context before sending it to the model', async () => {
@@ -318,10 +513,10 @@ describe('DeepSeek Harness model JSON retries', () => {
     const context = { jobId: 'gproj_compact', projectorVersion: 1, events: [event], existingNodes, existingEdges }
     const proposedNodes = [
       ...Array.from({ length: 6 }, (_, index) => ({
-        ref: `invalid_${index}`, name: `Invalid ${index}`, type: 'project', tags: [], sourceEventIds: ['evt_unknown'],
+        ref: `invalid_${index}`, name: `Invalid ${index}`, type: 'project', tags: [], metadataProvenance: { name: ['evt_unknown'] }, sourceEventIds: ['evt_unknown'],
       })),
       ...Array.from({ length: 30 }, (_, index) => ({
-        ref: `proposal_${index}`, name: `Proposal ${index}`, type: 'project', tags: [], sourceEventIds: [event.id],
+        ref: `proposal_${index}`, name: `Proposal ${index}`, type: 'project', tags: [], metadataProvenance: { name: [event.id] }, sourceEventIds: [event.id],
       })),
     ]
     const proposedEdges = [
@@ -379,6 +574,44 @@ describe('DeepSeek Harness model JSON retries', () => {
   })
 })
 
+describe('DeepSeek Harness adapter readiness', () => {
+  it('tracks the exact route and publishes adapter-registry updates', () => {
+    let providers: Array<{ id: string; name: string }> = []
+    let adapterUpdated = () => {}
+    const ctx = {
+      llm: {
+        listProviders: () => providers,
+        stream: vi.fn(),
+      },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'default-provider', model: 'default-model' }) },
+      on: (_event: string, listener: () => void) => { adapterUpdated = listener },
+      logger: { warn: vi.fn() },
+    } as unknown as Context
+    const bridge = new DshModelBridge(ctx, {
+      database: ':memory:', namespaceMode: 'session', namespacePrefix: 'test', globalNamespace: 'global',
+      blockTurnSize: 1, blockDecayLambda: 0.3, ingestSubagents: false, maxOutputTokens: 256,
+    })
+    const session = { id: 'adapter-ready', requestHeader: () => ({ config: { provider: 'session-provider', model: 'session-model' } }) } as unknown as Session
+    const listener = vi.fn()
+    const dispose = bridge.onAdaptersUpdated(listener)
+
+    expect(bridge.isReady(session)).toBe(false)
+    expect(bridge.isReady()).toBe(false)
+    providers = [
+      { id: 'session-provider', name: 'Session Provider' },
+      { id: 'default-provider', name: 'Default Provider' },
+    ]
+    adapterUpdated()
+    expect(bridge.isReady(session)).toBe(true)
+    expect(bridge.isReady()).toBe(true)
+    expect(listener).toHaveBeenCalledTimes(1)
+
+    dispose()
+    adapterUpdated()
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('reasoningEffort off compatibility', () => {
   const summaryTool = { l0Title: 'ok', l0Tags: [], l1Summary: 'valid', l2Keypoints: [], shouldExtract: false }
 
@@ -386,6 +619,7 @@ describe('reasoningEffort off compatibility', () => {
     resolveModelInfo: (...args: any[]) => Promise<any>,
     stream?: (options: any) => AsyncIterable<any>,
     structuredReasoningEffort: 'auto' | 'force-off' = 'auto',
+    liveStructuredReasoningEffort?: () => 'auto' | 'force-off',
   ): { bridge: DshModelBridge; session: Session; calls: ReturnType<typeof vi.fn>; warnings: ReturnType<typeof vi.fn>; adapterUpdated: () => void } {
     const calls = vi.fn()
     const warnings = vi.fn()
@@ -409,7 +643,7 @@ describe('reasoningEffort off compatibility', () => {
       blockTurnSize: 1, blockDecayLambda: 0.3, ingestSubagents: false, maxOutputTokens: 512,
       structuredTaskTimeoutMs: 50,
       structuredReasoningEffort,
-    })
+    }, liveStructuredReasoningEffort)
     const session = { id: 'off-test', requestHeader: () => ({ config: { provider: 'provider-a', model: 'model-a' } }) } as unknown as Session
     return { bridge, session, calls, warnings, adapterUpdated: () => adapterUpdated() }
   }
@@ -424,6 +658,18 @@ describe('reasoningEffort off compatibility', () => {
     const { bridge, session, calls } = bridgeWithCapability(async () => ({ reasoning: { efforts: [{ id: 'low', name: 'Low' }] } }))
     await bridge.run(session, () => bridge.summarizer([]))
     expect(calls.mock.calls[0]?.[0]).not.toHaveProperty('reasoningEffort')
+  })
+
+  it('reads a changed DSH 0.1.7 live config before each structured call', async () => {
+    let mode: 'auto' | 'force-off' = 'auto'
+    const { bridge, session, calls, adapterUpdated } = bridgeWithCapability(async () => ({}), undefined, 'auto', () => mode)
+    await bridge.run(session, () => bridge.summarizer([]))
+    mode = 'force-off'
+    await bridge.run(session, () => bridge.summarizer([]))
+    mode = 'auto'
+    adapterUpdated()
+    await bridge.run(session, () => bridge.summarizer([]))
+    expect(calls.mock.calls.map(([request]) => request.reasoningEffort)).toEqual([undefined, 'off', undefined])
   })
 
   it.each([

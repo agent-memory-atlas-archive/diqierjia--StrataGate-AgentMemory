@@ -123,13 +123,19 @@ export interface EventCardInput {
   confidence?: number;
 }
 
-export interface EventCard extends Omit<EventCardInput, 'id'> {
+export interface EventCard extends Omit<EventCardInput, 'id' | 'sourceBlockId'> {
   id: string;
   /** Conversation turn where this Event entered its long-term-memory lifecycle. */
   formedTurn?: number;
   narrative: string;
   tags: string[];
   quotes: string[];
+  /**
+   * Provenance block. Always present for conversation-derived and imported
+   * Events; agent-recorded Events may omit it when their provenance cites
+   * real open-tail conversation messages directly.
+   */
+  sourceBlockId?: string;
   temporal: EventTemporal;
   scope: MemoryScope;
   criticality: MemoryCriticality;
@@ -295,6 +301,73 @@ export interface ExternalMemoryUndoResult {
   restoredEventIds: string[];
 }
 
+/** Taxonomy the agent picks from when recording a memory through memory_remember. */
+export type AgentMemoryCategory = 'preference' | 'decision' | 'correction' | 'fact';
+
+/** How the pre-write gate reached its verdict. */
+/**
+ * Input for agent-recorded events: provenance may cite real conversation
+ * messages directly (no source block) — `sourceMessageIds` must then exist in
+ * the store's open tail or blocks at validation time.
+ */
+export type AgentEventCardInput = Omit<EventCardInput, 'sourceBlockId'> & {
+  sourceBlockId?: string;
+  formedTurn?: number;
+};
+
+export type AgentEventGatePath =
+  | 'exact-duplicate'
+  | 'near-duplicate'
+  | 'clear-new'
+  | 'decider'
+  | 'heuristic-conflict'
+  | 'decider-error';
+
+/** Outcome of the gate; agent events are ordinary Events once recorded. */
+export type AgentEventGateAction =
+  | 'ADDED'
+  | 'REINFORCED'
+  | 'MERGED'
+  | 'SUPERSEDED'
+  | 'CONFLICT_MARKED'
+  | 'IGNORED';
+
+export interface AgentEventRecordOptions {
+  content: string;
+  category?: AgentMemoryCategory;
+  /**
+   * Optional synchronous adjudicator reusing the external-memory decision
+   * contract. Omitted → deterministic/heuristic policy only.
+   */
+  decider?: ExternalMemoryDecider;
+  /** Top-K search width for the pre-write lookup. Default 5, clamped 1..20. */
+  topK?: number;
+  /** Recording session id, stored as temporal.threadId for dashboard grouping. */
+  threadId?: string;
+  importedAt?: string;
+}
+
+export interface AgentEventRecordResult {
+  action: AgentEventGateAction;
+  gate: AgentEventGatePath;
+  recorded: boolean;
+  /** Created event (ADDED/MERGED/SUPERSEDED/CONFLICT_MARKED). */
+  eventId?: string;
+  /** Existing event reinforced instead of writing (REINFORCED). */
+  reinforcedEventId?: string;
+  existingEventIds: string[];
+  matchedEventIds: string[];
+  /** Gate confidence; not the stored event confidence. */
+  confidence?: number;
+  downgradedFrom?: 'MERGE' | 'SUPERSEDE';
+  reason?: string;
+  sourceBlockId?: string;
+  /** Real conversation messages cited as provenance (open tail or blocks). */
+  sourceMessageIds?: string[];
+  /** memoryWeightAt(event, currentTurn) at write time. */
+  weight?: number;
+}
+
 export type MemoryElementType = 'person' | 'project' | 'organization' | 'tool' | 'place';
 export type ElementFactMode = 'state' | 'set' | 'relation';
 export type ElementFactStatus = 'active' | 'superseded' | 'disputed';
@@ -373,6 +446,17 @@ export interface GraphFact {
   updatedAt: string;
 }
 
+export interface GraphMetadataProvenanceEntry {
+  value: string;
+  sourceEventIds: string[];
+}
+
+export interface GraphNodeMetadataProvenance {
+  name?: string[];
+  aliases?: GraphMetadataProvenanceEntry[];
+  tags?: GraphMetadataProvenanceEntry[];
+}
+
 export interface GraphNode {
   id: string;
   name: string;
@@ -380,6 +464,8 @@ export interface GraphNode {
   aliases: string[];
   /** Optional semantic roles used for discovery and dynamic graph presentation. */
   tags?: string[];
+  /** Optional field-level Event provenance; absent on legacy nodes. */
+  metadataProvenance?: GraphNodeMetadataProvenance;
   currentState: string;
   facts: GraphFact[];
   status: GraphRecordStatus;
@@ -410,6 +496,8 @@ export interface GraphNodeProjection {
   aliases?: string[];
   /** Semantic roles are additive metadata and never replace the stable node type. */
   tags?: string[];
+  /** New projectors should cite the exact Events for each metadata value. */
+  metadataProvenance?: GraphNodeMetadataProvenance;
   state?: string;
   facts?: Array<{ key: string; value: string | string[]; sourceEventIds: string[] }>;
   status?: GraphRecordStatus;
@@ -453,6 +541,11 @@ export interface SearchOptions {
   eventType?: string;
   happenedFrom?: string;
   happenedTo?: string;
+  /**
+   * Relative weight of the agent-recorded pool when its ranking fuses with
+   * the conversation-derived pool (1 = equal footing, 0 = never surfaced).
+   */
+  agentMemoryWeight?: number;
   /** Disable retrieval bookkeeping for read-only previews. */
   trackRetrieval?: boolean;
 }
@@ -487,6 +580,26 @@ export interface GraphNodeSearchResult {
   matchedFields?: string[];
   /** Human-readable explanation of why this node passed the lexical filter. */
   matchReason?: string;
+  /** Whether the query meaningfully matched current evidence, historical evidence, or both. */
+  matchType?: 'current' | 'historical' | 'both';
+  /** Query-matched effective records. The node itself still carries the complete effective current state. */
+  currentFacts?: GraphFact[];
+  historicalFacts?: GraphFact[];
+  currentEdges?: GraphEdge[];
+  historicalEdges?: GraphEdge[];
+  /** Bounded Event evidence selected for this specific result. */
+  provenanceEventIds?: string[];
+  /** Legacy metadata was trusted but could not be fully expanded within the evidence budget. */
+  metadataEvidenceStatus?: 'not_expanded';
+  timeline?: GraphTimelineEvent[];
+}
+
+export interface GraphTimelineEvent {
+  id: string;
+  title: string;
+  summary: string;
+  status: MemoryStatus;
+  time?: string;
 }
 
 export interface RawSearchHit {

@@ -12,6 +12,8 @@ export interface Config {
   blockTurnSize?: number
   blockDecayLambda?: number
   ingestSubagents?: boolean
+  agentMemoryEnabled?: boolean
+  agentMemoryRetrievalWeight?: number
   provider?: string
   model?: string
   maxOutputTokens?: number
@@ -31,6 +33,8 @@ export interface ResolvedConfig {
   blockTurnSize: number
   blockDecayLambda: number
   ingestSubagents: boolean
+  agentMemoryEnabled?: boolean
+  agentMemoryRetrievalWeight?: number
   provider?: string
   model?: string
   maxOutputTokens: number
@@ -63,7 +67,13 @@ export const StructuredReasoningEffortSettings: z<StructuredReasoningEffortSetti
     .comment('控制检索次数、返回数量和记忆采用信息的聊天内提示；检索与采用不受影响。'),
 })
 
-export const Config: z<Config> = z.object({
+// Schemastery 3.18.2 (DSH <= 0.1.6) has no volatile fields. Earlier hosts
+// publish these controls through settings.installSection instead.
+export function volatileIfSupported<T>(schema: T): T {
+  return (schema as { volatile?: () => T }).volatile?.() ?? schema
+}
+
+export const Config = z.object({
   database: z.string().required(),
   sessionRoot: z.string(),
   namespaceMode: z.union(['project', 'session', 'global'] as const).default('project'),
@@ -74,15 +84,31 @@ export const Config: z<Config> = z.object({
     .description('Block 衰减系数 λ')
     .comment('默认 0.3；数字越小，记忆遗忘越慢，消耗 token 越多，不建议大于 0.4。'),
   ingestSubagents: z.boolean().default(false),
+  agentMemoryEnabled: z.boolean().default(true)
+    .description('启用 agent 主动记忆（memory_remember）')
+    .comment('开启后 agent 可以把值得记忆的事实写入长期记忆 Event 管线：进入数据库、参与知识图谱、跨会话共享；写入前会自动检测并消解重复与冲突。'),
+  agentMemoryRetrievalWeight: z.number().step(0.05).min(0).max(5).default(1)
+    .description('主动记忆在检索中的占比权重')
+    .comment('agent 记录与对话派生记忆分别独立排序后按权重融合：1 为平权，0 为不浮现 agent 记录，大于 1 则提升 agent 记录的排序权重。'),
   provider: z.string(),
   model: z.string(),
   maxOutputTokens: z.natural().min(256).default(2_048),
   structuredTaskTimeoutMs: z.natural().min(1_000).default(120_000),
-  structuredReasoningEffort: z.union(['auto', 'force-off'] as const).default('auto'),
-  showStrataGateStatus: z.boolean().default(true),
-  showShortTermStatus: z.boolean().default(true),
-  showRetrievalStatus: z.boolean().default(true),
+  structuredReasoningEffort: volatileIfSupported(z.union(['auto', 'force-off'] as const).default('auto')),
+  showStrataGateStatus: volatileIfSupported(z.boolean().default(true)),
+  showShortTermStatus: volatileIfSupported(z.boolean().default(true)),
+  showRetrievalStatus: volatileIfSupported(z.boolean().default(true)),
 })
+
+export function liveConfigValue<T>(value: T): T {
+  return value && typeof value === 'object' && 'get' in value && typeof value.get === 'function'
+    ? (value as { get(): T }).get()
+    : value
+}
+
+export function isLiveConfigValue(value: unknown): value is { get(): unknown } {
+  return value !== null && typeof value === 'object' && 'get' in value && typeof value.get === 'function'
+}
 
 export function resolveConfig(config: Config): ResolvedConfig {
   const database = config.database?.trim() ?? ''
@@ -104,12 +130,14 @@ export function resolveConfig(config: Config): ResolvedConfig {
     blockTurnSize: Math.max(1, Math.floor(config.blockTurnSize ?? 6)),
     blockDecayLambda: Math.max(0, config.blockDecayLambda ?? 0.3),
     ingestSubagents: config.ingestSubagents ?? false,
+    agentMemoryEnabled: config.agentMemoryEnabled ?? true,
+    agentMemoryRetrievalWeight: Math.min(5, Math.max(0, config.agentMemoryRetrievalWeight ?? 1)),
     ...(provider && model ? { provider, model } : {}),
     maxOutputTokens: Math.max(256, Math.floor(config.maxOutputTokens ?? 2_048)),
     structuredTaskTimeoutMs: Math.max(1_000, Math.floor(config.structuredTaskTimeoutMs ?? 120_000)),
-    structuredReasoningEffort: config.structuredReasoningEffort ?? 'auto',
-    showStrataGateStatus: config.showStrataGateStatus ?? true,
-    showShortTermStatus: config.showShortTermStatus ?? true,
-    showRetrievalStatus: config.showRetrievalStatus ?? true,
+    structuredReasoningEffort: liveConfigValue(config.structuredReasoningEffort) ?? 'auto',
+    showStrataGateStatus: liveConfigValue(config.showStrataGateStatus) ?? true,
+    showShortTermStatus: liveConfigValue(config.showShortTermStatus) ?? true,
+    showRetrievalStatus: liveConfigValue(config.showRetrievalStatus) ?? true,
   }
 }

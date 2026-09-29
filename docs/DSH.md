@@ -81,13 +81,49 @@ Removing the plugin does not delete that database.
 - Each DSH turn has a durable ingestion receipt, so replay or retry cannot store it twice.
 - StrataGate performs Block summarization, Event extraction, versioned Knowledge Graph projection, search, Evidence Gate, and use-only reinforcement.
 - When a Block reaches its boundary, StrataGate first seals durable L3-L5 without touching the DSH surface. Only after validated L0-L2 and Event processing make the Block ready does the plugin use native surface `replace`; pending or failed Blocks keep their original conversation messages. Later decay, manual lift, or λ changes update only ready checkpoints. Unsealed open-tail messages and complete tool-call/result chains remain native DSH messages.
-- Before every main-model call, dynamic system context injects only up to four project-scoped activated Events and four active Graph nodes. It never serializes the current conversation, open tail, sealed Blocks, or tool calls into that prompt.
+- Before every main-model call, a separate Persistent Profile context injects its nonempty global fields without retrieval. The dynamic memory context injects up to four project-scoped activated Events and four active Graph nodes. It never serializes the current conversation, open tail, sealed Blocks, or tool calls into that prompt.
 
 Activated memory uses the current human message plus the latest two open-tail turns from the current session as its query. Existing BM25 search remains the lexical relevance gate; pinned and safety memory are the only exceptions. Existing memory weights provide a second ranking, and RRF fuses the relevance and weight rankings. The activated section has a fixed budget of about 900 tokens, so it does not grow with the database.
 
 Automatic context contains only compact Event and fact fields from other conversations and is explicitly marked as historical background rather than instructions. Current-session Block evidence is excluded because each Block's current decayed representation already exists in native DSH history. Building automatic context never calls `recordMemoryUse`, increments `mentionCount`, or changes `lastAdoptedTurn`. The existing `memory_*` tools remain available for deeper, evidence-gated retrieval and are the only path to adoption reinforcement.
 
 Every explicit retrieval creates an independent batch. The model passes its `batch_id` to `memory_assess`, then closes that same batch with `memory_record_use`. It passes the exact `evidence_refs` from that batch used in its answer, or `[]` when it used none. Selected Event evidence is reinforced once; an empty list writes a zero-increment receipt with the real batch ID.
+
+### Agent-recorded memory
+
+Choose by scope: `memory_profile_update` changes a global Persistent Profile field supplied to every future conversation without retrieval; `memory_remember` stores an Event surfaced when relevant, such as a project-specific preference or a past decision. A one-turn request needs neither. The word "remember" does not select a tool, and the same information should normally be stored in one place. An inferred Profile change still requires the consent specified by that tool.
+
+`memory_remember` lets the agent record facts proactively: context-specific user preferences or
+corrections, decisions, and durable project facts when they need to be recalled in relevant situations.
+Recordings enter the same long-term Event pipeline as conversation-derived memory, with
+two differences:
+
+- **Isolated storage.** Agent-recorded Events live in dedicated `agent_events` tables that
+  mirror the Event model but are physically separate from the passive conversation tables.
+  Their provenance cites the **real conversation messages** of the recording session — the
+  open-tail user/assistant messages when available, otherwise the latest sealed Block of
+  that thread — so no fabricated user message is ever created. Only when a session has no
+  ingested messages at all does a synthetic `agent-memory:` provenance Block get created.
+- **Pre-write resolution.** Before writing, StrataGate searches existing memory (both pools)
+  for duplicates and conflicts. Exact and near duplicates reinforce the existing card instead
+  of writing a new one. Ambiguous lexical overlap triggers one synchronous model adjudication
+  reusing the external-memory decision contract: `ADD`, `MERGE`, `SUPERSEDE` (high confidence
+  only — low-confidence merge/supersede is downgraded to a non-destructive conflict mark),
+  `CONFLICT` (symmetric back-links), or `IGNORE`. The tool result reports `action`, `gate`,
+  and `reason`. Facts with no meaningful overlap write directly without a model call.
+
+Everything else is ordinary Event behavior: agent recordings project into the Knowledge
+Graph, persist across sessions, decay and reinforce through the same turn-based lifecycle
+(`memory_assess` → `memory_record_use`), and can be forgotten through that lifecycle.
+Retrieval gives each pool its own top-k lane — the passive pool and the agent pool are
+ranked independently, then fused with weighted RRF, so neither pool can crowd the other
+out of the result window. The agent lane's share is the configurable
+`agentMemoryRetrievalWeight` (default `1` = equal footing; `0` = recordings stay stored but
+never surface; higher values boost agent recordings), and cards carry
+`source: 'agent-recorded'`. The memory dashboard lists them under
+`/api/stratagate/agent-memories` (query parameters `session` and `includeArchived=true`).
+The feature can be disabled entirely with `agentMemoryEnabled: false`, which also
+unregisters the tool.
 
 The plugin registers these tools:
 
@@ -96,7 +132,8 @@ memory_search_events   memory_expand_event
 memory_search_graph    memory_expand_graph_node
 memory_search_raw      memory_get_blocks
 memory_expand_block    memory_assess
-memory_record_use
+memory_record_use      memory_remember
+memory_profile_update
 ```
 
 `memory_get_blocks` accepts `scope=session` (the default, preserving the historical
@@ -131,7 +168,9 @@ Open DSH Settings and select **StrataGate-AgentMemory**. The page provides:
 - manual Block expansion and a two-step external-memory import flow;
 - a Usage Audit chain from a recorded answer turn, through the Evidence Gate verdict and selected memories, back to source messages.
 
-Events, graph facts, and source messages cannot be edited, deleted, or approved in the UI. The UI can still change memory state in three explicit ways: manually expand a Block, import memory exported by another AI, and use Advanced Settings to change the completed turns per Block or the global Block decay coefficient λ. When the Block size changes, the UI explains their relationship and suggests a λ that preserves the decay rate per conversation turn; the user decides whether to adopt it. Saved settings immediately apply to every existing workspace, become the defaults for future workspaces, and survive restarts. Existing sealed Blocks are never repartitioned.
+Events, graph facts, and source messages cannot be edited, deleted, or approved in the UI. The UI can manually expand a Block, import memory exported by another AI, and change the completed turns per Block or the global Block decay coefficient λ in Advanced Settings. When the Block size changes, the UI explains their relationship and suggests a λ that preserves the decay rate per conversation turn; the user decides whether to adopt it. Saved settings immediately apply to every existing workspace, become the defaults for future workspaces, and survive restarts. Existing sealed Blocks are never repartitioned.
+
+The primary Persistent Profile tab edits nine fixed fields in compact groups, one field at a time. It refreshes about every five seconds while visible, preserves an open draft, and prevents a stale same-field save from overwriting a concurrent change. The same installation-wide Profile is used by `memory_profile_update`, across sessions and namespaces. The preferred answer language applies only to the final answer; the independent visible reasoning language applies only to reasoning/thinking text exposed by the host UI when supported, never to hidden internal reasoning. An empty visible reasoning language adds no extra requirement. Each saved field takes effect on the next model call; empty fields are omitted. Profile values use Unicode code-point limits of 100/100/100/100/1000/1000/1500/1000/1200 characters, with a 6000-character total budget and a 4800-character maintenance trigger. The SQLite database records each Settings, tool, and maintenance change with its previous value and source. Maintenance runs when 24 hours have passed since the first nonempty write or the last successful run, or when a capacity threshold is reached; it sees only the current Profile and may compress wording without adding facts or semantically rewriting the four short fields. Event extraction and Graph projection never write Profile fields.
 
 The UI validates and previews pasted `stratagate.external-memory.v2` JSON before writing. Malformed input uses a model-backed recovery fallback whose candidates always require review. Exact duplicates are ignored deterministically; the configured model adjudicates other candidates against Top-K local Events as add, merge, supersede, conflict, or ignore. Analysis jobs persist per-candidate progress in SQLite, resume after the import page is reopened, and let users choose the action for low-confidence decisions. High-confidence decisions remain automatic, and a committed import can be undone as one batch. Common token and credential patterns are redacted in message content and structured tool traces before they leave the local server. The SQLite database remains the source of truth.
 
@@ -146,6 +185,8 @@ config:
   blockTurnSize: 6
   blockDecayLambda: 0.3
   ingestSubagents: false
+  agentMemoryEnabled: true
+  agentMemoryRetrievalWeight: 1
   maxOutputTokens: 10000
   structuredTaskTimeoutMs: 120000
   structuredReasoningEffort: auto # auto | force-off
@@ -162,6 +203,8 @@ config:
 
 `blockDecayLambda` controls decay by the distance between a Block's pointer anchor and the latest sealed Block in the same DSH session. It defaults to `0.3`. Smaller values decay more slowly; values above `0.4` are not recommended. Turns in the open tail do not increase Block age.
 
+`agentMemoryEnabled` (default `true`) controls agent-recorded memory (see above); disabling it also unregisters `memory_remember`. `agentMemoryRetrievalWeight` (default `1`, range `0`–`5`) sets the agent lane's share in merged retrieval. Recordings are stored in the same SQLite database as the rest of StrataGate data.
+
 If `provider` and `model` are omitted, memory processing uses the session's latest request route, then the DSH default model as fallback. They must be configured as a pair.
 
 ## Privacy and failure behavior
@@ -172,9 +215,11 @@ For diagnostics, the five most recent successful memory-model responses are reta
 
 ## Compatibility and permissions
 
-Release gates exercise the complete DSH `0.1.2-rc.1` family, `@deepseek-ai/dsh@0.1.5-rc.1`, and `@deepseek-ai/dsh@0.1.6-alpha.1` on Node `24`, on both Linux and Windows. The 0.1.5 CLI's real dependency tree resolves its internal DSH packages to `0.1.5-rc.2`; the 0.1.6 CLI resolves the tested internal DSH and Session Format packages to `0.1.6-alpha.1`. The plugin declares these packages as optional, exact-version peers so the host supplies one coherent runtime instead of npm installing a second copy. Other `0.1.x` versions are not implicitly supported.
+Release gates exercise the complete DSH `0.1.2-rc.1` family, `@deepseek-ai/dsh@0.1.5-rc.1`, `@deepseek-ai/dsh@0.1.6-alpha.1`, `@deepseek-ai/dsh@0.1.7-rc.1`, and `@deepseek-ai/dsh@0.1.7-rc.2` on Node `24`, on both Linux and Windows. The 0.1.5 CLI's real dependency tree resolves its internal DSH packages to `0.1.5-rc.2`; the 0.1.6 and 0.1.7 CLIs resolve the tested internal DSH and Session Format packages to their respective versions. The 0.1.7 host also supplies Cordis `4.0.4` and Schemastery `3.18.4`. Optional peers for the DSH `0.1.7` packages now accept `>=0.1.7-rc.1 <0.1.8-0`. Startup still requires one coherent DSH internal version and limits Cordis and Schemastery to compatible patch lines. Later `0.1.7` releases can install without a plugin update, but the release gate only tests the versions listed above; compatibility checks remain advisable after a host upgrade. DSH `0.1.8` is excluded.
 
-DSH core packages are host-provided optional peers. After upgrading a profile that once installed those peers locally, run `dsh plugin --profile <name> exec stratagate-dsh-repair` before starting it. The command moves only the known DSH runtime packages into `.stratagate-runtime-backups` inside that profile and writes a recovery receipt; it does not delete them or touch session data. At startup, a bootstrap resolver also forces StrataGate's own imports through the installation-owned module fallback, then verifies the resolved DSH core family and stops with an actionable error for an unknown host family. On DSH `0.1.5` and `0.1.6`, v0 sessions containing the retired `stratagate/memory-citations` event are copied to a validated v1 generation before the host continues its migration chain. The original v0 log is never modified; a `stratagate-legacy-citations-v1.json` receipt records source/target hashes and recovery instructions.
+DSH core packages are host-provided optional peers. After upgrading a profile that once installed those peers locally, run `dsh plugin --profile <name> exec stratagate-dsh-repair` before starting it. The command moves only the known DSH runtime packages into `.stratagate-runtime-backups` inside that profile and writes a recovery receipt; it does not delete them or touch session data. At startup, a bootstrap resolver also forces StrataGate's own imports through the installation-owned module fallback, then verifies the resolved DSH core family and stops with an actionable error for an unknown host family. On DSH `0.1.5` through `0.1.7`, v0 sessions containing the retired `stratagate/memory-citations` event are copied to a validated v1 generation before the host continues its migration chain. The original v0 log is never modified; a `stratagate-legacy-citations-v1.json` receipt records source/target hashes and recovery instructions.
+
+DSH 0.1.7 stores plugin configuration in the profile and presents live controls through config forms. StrataGate's chat settings use those forms on 0.1.7 and the older settings service on earlier supported hosts. Changing the structured reasoning effort takes effect on subsequent memory-model calls without a plugin restart.
 
 DSH 0.1.6's official DeepSeek profile may enable Session Log request metadata by default, so the Host can include original Session Events in the `dsh_session_log` request field. This metadata is outside the model messages, system prompt, and tool schema and does not indicate that StrataGate compression was bypassed. StrataGate does not alter this DSH-wide setting; users who want it disabled should set `session-log-deepseek.enabled=false` through DSH configuration.
 

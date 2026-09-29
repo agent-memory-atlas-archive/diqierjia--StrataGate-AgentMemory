@@ -1,11 +1,13 @@
 import { mkdtemp, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import AgentDefaultModelConfig from '@deepseek-ai/dsh-agent-default-model'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
-import FileSettingsRuntime from '@deepseek-ai/dsh-settings-file'
 import type { Session } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -13,7 +15,17 @@ import { describe, expect, it } from 'vitest'
 import * as plugin from '../src/index.js'
 
 describe('DSH plugin composition', () => {
-  it('persists global chat display preferences across a complete plugin restart', async () => {
+  const legacySettingsModule = (() => {
+    const hostRoot = process.env.DSH_ROOT
+    if (hostRoot) {
+      try { return createRequire(join(hostRoot, 'package.json')).resolve('@deepseek-ai/dsh-settings-file') } catch {}
+    }
+    try { return createRequire(import.meta.url).resolve('@deepseek-ai/dsh-settings-file') } catch { return undefined }
+  })()
+  const legacySettingsAvailable = Boolean(legacySettingsModule && existsSync(legacySettingsModule))
+
+  it.skipIf(!legacySettingsAvailable)('persists legacy global chat display preferences across a complete plugin restart', async () => {
+    const { default: FileSettingsRuntime } = await import(pathToFileURL(legacySettingsModule!).href)
     const directory = await mkdtemp(join(tmpdir(), 'stratagate-dsh-display-settings-'))
     const settingsPath = join(directory, 'settings.json')
     const database = join(directory, 'memory.db')
@@ -32,7 +44,7 @@ describe('DSH plugin composition', () => {
     let restarted: Context | undefined
     try {
       first = await mount()
-      const settings = first.get('settings')!
+      const settings = first.get('settings') as unknown as { update(ns: string, value: object): Promise<void>; get(ns: string): unknown }
       await settings.update(plugin.STRATAGATE_SETTINGS_NAMESPACE, {
         showStrataGateStatus: false,
         showShortTermStatus: false,
@@ -47,7 +59,7 @@ describe('DSH plugin composition', () => {
       first = undefined
 
       restarted = await mount()
-      expect(restarted.get('settings')!.get(plugin.STRATAGATE_SETTINGS_NAMESPACE)).toMatchObject({
+      expect((restarted.get('settings') as unknown as { get(ns: string): unknown }).get(plugin.STRATAGATE_SETTINGS_NAMESPACE)).toMatchObject({
         showStrataGateStatus: false,
         showShortTermStatus: false,
         showRetrievalStatus: false,
@@ -102,6 +114,25 @@ describe('DSH plugin composition', () => {
     }
   })
 
+  it('registers a custom settings page policy through DSH 0.1.7 settings forms', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-dsh-config-forms-'))
+    const ctx = new Context()
+    const presentations: unknown[] = []
+    try {
+      await ctx.plugin(LlmRuntime)
+      await ctx.plugin(SystemPrompt, {})
+      await ctx.plugin(ToolRuntime, { mode: 'native' })
+      ctx.provide('agentDefaultModel', { currentSelection: () => ({ provider: 'test', model: 'test' }) } as any)
+      ctx.provide('webServer', { host: '127.0.0.1', port: 10259, register: () => () => {} })
+      ctx.provide('settings', { configure: (policy: unknown) => { presentations.push(policy); return () => {} } })
+      await ctx.plugin(plugin, { database: join(directory, 'memory.db') })
+      expect(presentations).toEqual([{ auto: false }])
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('loads into the official Cordis services and registers the complete memory protocol', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'stratagate-dsh-plugin-'))
     const ctx = new Context()
@@ -113,37 +144,69 @@ describe('DSH plugin composition', () => {
       ctx.provide('webServer', { host: '127.0.0.1', port: 10259, register: () => () => {} })
       await ctx.plugin(plugin, { database: join(directory, 'memory.db') })
 
-      const names = ctx.tools.schemas().map(({ name }) => name)
-      expect(names).toEqual(expect.arrayContaining([
+      const tools = ctx.tools.schemas()
+      const names = tools.map(({ name }) => name)
+      expect(names).toEqual([
+        'memory_profile_update',
         'feedback_prepare',
         'memory_search_events',
-        'memory_expand_event',
         'memory_search_graph',
         'memory_expand_graph_node',
         'memory_search_elements',
-        'memory_expand_element',
         'memory_search_raw',
         'memory_get_blocks',
         'memory_expand_block',
+        'memory_expand_event',
+        'memory_expand_element',
         'memory_assess',
         'memory_record_use',
-      ]))
+        'memory_remember',
+      ])
+      for (const tool of tools) {
+        expect(tool.description, tool.name).toMatch(/^This tool is provided by the StrataGate plugin\./)
+      }
       const prompt = await ctx.systemPrompt.assemble()
+      const memorySections = prompt.sections.filter(({ name }) => name === 'tool:stratagate-memory')
+      expect(memorySections).toHaveLength(1)
       expect(prompt.sections).toContainEqual(expect.objectContaining({
         name: 'tool:stratagate-memory',
         text: expect.stringMatching(/StrataGate provides durable, evidence-gated memory[\s\S]*independent batch[\s\S]*batch_id/),
       }))
       expect(prompt.sections).toContainEqual(expect.objectContaining({
+        name: 'tool:stratagate-memory',
+        text: expect.stringMatching(/memory_profile_update[\s\S]*memory_remember[\s\S]*one place[\s\S]*conflict-marked/),
+      }))
+      const memoryProtocol = memorySections[0]!.text
+      const layeredBlockProtocol = [
+        'StrataGate represents earlier conversation history as layered Blocks:',
+        '',
+        '- L0: title and topical tags — the most compressed view.',
+        '- L1: short self-contained summary.',
+        '- L2: key facts, decisions, constraints, preferences, results, and open items.',
+        '- L3: deterministically condensed conversation.',
+        '- L4: readable near-verbatim conversation.',
+        '- L5: complete source messages and tool records.',
+        '',
+        'Higher levels contain more source detail.',
+        'If the current level does not contain enough evidence for the task,',
+        'do not infer omitted details; expand the Block or inspect raw memory.',
+      ].join('\n')
+      expect(memoryProtocol).toContain(layeredBlockProtocol)
+      for (const level of ['L0', 'L1', 'L2', 'L3', 'L4', 'L5']) {
+        expect(memoryProtocol.match(new RegExp(`^- ${level}:`, 'gmu'))).toHaveLength(1)
+      }
+      expect(prompt.sections).toContainEqual(expect.objectContaining({
         name: 'tool:stratagate-feedback',
         text: expect.stringMatching(/clear error signal[\s\S]*at most one proactive feedback suggestion[\s\S]*namespace plus its substantive characteristics[\s\S]*feedback_prepare itself/),
       }))
 
+      const conversationMessages: Array<{ id: string; role: 'user' | 'assistant'; content: Array<{ type: 'text'; text: string }>; source: { kind: 'user' | 'model' } }> = []
       const session = {
         id: 'auto-context-session',
         header: { id: 'auto-context-session', version: 0, createdAt: 0, cwd: directory },
         snapshotEvents: () => [],
         eventAt: () => undefined,
-        deriveMessages: () => [],
+        deriveMessages: () => conversationMessages,
       } as unknown as Session
       const steered: unknown[] = []
       const agent = {
@@ -157,15 +220,97 @@ describe('DSH plugin composition', () => {
         name: 'stratagate:auto-memory',
         text: expect.stringContaining('[Activated long-term memory]'),
       }))
+      expect(scopedPrompt.contexts.some((item) => item.name === 'stratagate:persistent-profile')).toBe(false)
 
       const search = ctx.tools.get('memory_search_events')
+      const profileUpdate = ctx.tools.get('memory_profile_update')
       const feedbackPrepare = ctx.tools.get('feedback_prepare')
       const recordUse = ctx.tools.get('memory_record_use')
+      const remember = ctx.tools.get('memory_remember')
       expect(search).toBeDefined()
+      expect(profileUpdate).toBeDefined()
+      expect(profileUpdate!.description).toContain("用户明确要求修改时可直接执行")
+      expect(profileUpdate!.description).toContain("只有用户紧接着明确回复“同意”，才授权这一次修改")
+      expect(profileUpdate!.description).toContain("沉默、拒绝、换话题或提出不同修改都不算授权")
+      expect(profileUpdate!.description).toContain("只需在相关情境中想起的项目事实、经历、决定或偏好，请使用 memory_remember")
+      expect(profileUpdate!.description).toContain("默认回答语言只控制最终面向用户的回答")
+      expect(profileUpdate!.description).toContain("以后都用中文回答我")
+      expect(profileUpdate!.description).toContain("以后思考过程用中文")
+      expect(profileUpdate!.description).toContain("两者都要求时分别调用两次")
+      conversationMessages.push({ id: 'profile-user-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '以后默认都用中文回复。' }] })
+      expect(await profileUpdate!.execute({ field: 'preferredLanguage', value: '中文' }, { agent, callId: 'profile-call' } as never))
+        .toEqual({ field: 'preferredLanguage', value: '中文', modified: true })
+      expect(await profileUpdate!.execute({ field: 'preferredLanguage', value: '中文' }, { agent, callId: 'profile-call-2' } as never))
+        .toEqual({ field: 'preferredLanguage', value: '中文', modified: false })
+      const nextPrompt = await ctx.systemPrompt.assemble({ agent })
+      expect(nextPrompt.contexts).toContainEqual(expect.objectContaining({ name: 'stratagate:persistent-profile', text: expect.stringContaining('Preferred answer language: 中文') }))
+      expect(nextPrompt.contexts.find((item) => item.name === 'stratagate:persistent-profile')?.text).not.toContain('Preferred visible reasoning language:')
+      expect(nextPrompt.contexts.find((item) => item.name === 'stratagate:persistent-profile')?.text).not.toContain('User background:')
+      conversationMessages.push({ id: 'both-languages', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '以后回答和思考过程都用中文。' }] })
+      expect(await profileUpdate!.execute({ field: 'preferredLanguage', value: '简体中文' }, { agent, callId: 'both-answer' } as never)).toMatchObject({ modified: true })
+      expect(await profileUpdate!.execute({ field: 'reasoningLanguage', value: '中文' }, { agent, callId: 'both-reasoning' } as never)).toMatchObject({ modified: true })
+      const bothPrompt = await ctx.systemPrompt.assemble({ agent })
+      const profileContext = bothPrompt.contexts.find((item) => item.name === 'stratagate:persistent-profile')?.text
+      expect(profileContext).toContain('Preferred answer language: 简体中文')
+      expect(profileContext).toContain('Preferred visible reasoning language: 中文')
+      for (const [id, utterance, field, value] of [
+        ['chinese-language', '以后都用英文回答我。', 'preferredLanguage', '英文'],
+        ['english-language', 'From now on, please answer me in English.', 'preferredLanguage', 'English'],
+        ['reasoning-language', '以后思考链用日语。', 'reasoningLanguage', '日语'],
+        ['chinese-name', '以后叫我橙子。', 'userPreferredName', '橙子'],
+        ['remember-assistant', '记住，你以后叫小橙。', 'assistantPreferredName', '小橙'],
+      ] as const) {
+        conversationMessages.push({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: utterance }] })
+        expect(await profileUpdate!.execute({ field, value }, { agent, callId: id } as never))
+          .toMatchObject({ field, value, modified: true })
+      }
+      const independentPrompt = await ctx.systemPrompt.assemble({ agent })
+      const independentContext = independentPrompt.contexts.find((item) => item.name === 'stratagate:persistent-profile')?.text
+      expect(independentContext).toContain('Preferred answer language: English')
+      expect(independentContext).toContain('Preferred visible reasoning language: 日语')
+      // The agent applies the description's consent rule; runtime does not parse proposal wording.
+      conversationMessages.push({ id: 'profile-proposal', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: 'I could keep responses concise in future. Reply 同意 to save responsePreferences = concise.' }] })
+      conversationMessages.push({ id: 'profile-consent', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '同意' }] })
+      expect(await profileUpdate!.execute({ field: 'responsePreferences', value: 'concise' }, { agent, callId: 'profile-consent' } as never))
+        .toMatchObject({ modified: true })
+      await expect(profileUpdate!.execute({ field: 'notAProfileField', value: 'x' } as never, { agent, callId: 'unknown-field' } as never))
+        .rejects.toThrow(/"field" must be one of|Unknown Persistent Profile field/)
+      await expect(profileUpdate!.execute({ field: 'preferredLanguage', value: 42 } as never, { agent, callId: 'non-string' } as never))
+        .rejects.toThrow(/string/)
+      await expect(profileUpdate!.execute({ field: 'preferredLanguage', value: 'x'.repeat(101) }, { agent, callId: 'too-long' } as never))
+        .rejects.toThrow(/100 characters/)
+      await expect(profileUpdate!.execute({ field: 'preferredLanguage', value: 'English', userPreferredName: 'wrong' } as never, { agent, callId: 'two-fields' } as never))
+        .rejects.toThrow(/Unknown Profile update argument/)
+      expect(profileUpdate!.parameters).toMatchObject({ required: ['field', 'value'], properties: { field: { type: 'string' }, value: { type: 'string' } } })
+      expect(profileUpdate!.parameters).toMatchObject({ properties: { field: { enum: expect.arrayContaining(['reasoningLanguage']) } } })
       expect(feedbackPrepare).toBeDefined()
       expect(recordUse).toBeDefined()
+      expect(remember).toBeDefined()
+      expect(remember!.description).toContain("保存的信息会按相关性被检索或提供给后续对话")
+      expect(remember!.description).toContain("同一信息默认只写入一处")
+      const remembered = await remember!.execute({
+        content: '用户偏好 pnpm 作为包管理器。',
+        category: 'preference',
+      }, {
+        agent,
+        callId: 'remember-call',
+      } as never) as unknown as Record<string, unknown>
+      expect(remembered).toMatchObject({
+        recorded: true,
+        action: 'ADDED',
+        gate: 'clear-new',
+        namespace: expect.stringContaining('dsh:project:'),
+      })
+      const autoPrompt = await ctx.systemPrompt.assemble({ agent })
+      expect(autoPrompt.contexts).toContainEqual(expect.objectContaining({
+        name: 'stratagate:auto-memory',
+        text: expect.stringContaining('[Activated long-term memory]'),
+      }))
       expect(feedbackPrepare!.description).toMatch(/directly requests it[\s\S]*explicitly agrees/)
-      expect(feedbackPrepare!.description).toMatch(/Never submit anything to GitHub[\s\S]*feedbackUrl/)
+      expect(feedbackPrepare!.description).toMatch(/current conversation[\s\S]*Never submit anything to GitHub/)
+      expect(feedbackPrepare!.description).toMatch(/draft is local and not submitted[\s\S]*feedbackUrl[\s\S]*打开反馈草稿/)
+      expect(feedbackPrepare!.description).toContain('要不要顺便让我尝试修复这个问题，并提交一个 PR？')
+      expect(feedbackPrepare!.description).toMatch(/ask exactly once[\s\S]*does not respond or declines, do not ask again/)
       const feedback = await feedbackPrepare!.execute({
         title: 'Local draft',
         description: 'A real failure from this conversation.',
@@ -193,7 +338,7 @@ describe('DSH plugin composition', () => {
       })
       expect(steered).toHaveLength(1)
       expect(steered[0]).toMatchObject({
-        source: { kind: 'plugin', plugin: 'stratagate-memory', form: 'instructions' },
+        source: { kind: 'plugin:stratagate-memory', form: 'instructions' },
       })
 
       await recordUse!.execute({ evidence_refs: [] }, {
@@ -206,6 +351,26 @@ describe('DSH plugin composition', () => {
         signal: new AbortController().signal,
       })
       expect(steered).toHaveLength(1)
+    } finally {
+      await ctx.fiber.dispose()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('unregisters memory_remember when agent memory is disabled', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-dsh-agent-disabled-'))
+    const ctx = new Context()
+    try {
+      await ctx.plugin(LlmRuntime)
+      await ctx.plugin(SystemPrompt, {})
+      await ctx.plugin(ToolRuntime, { mode: 'native' })
+      await ctx.plugin(AgentDefaultModelConfig, { provider: 'test', model: 'test' })
+      ctx.provide('webServer', { host: '127.0.0.1', port: 10260, register: () => () => {} })
+      await ctx.plugin(plugin, { database: join(directory, 'memory.db'), agentMemoryEnabled: false })
+
+      const names = ctx.tools.schemas().map(({ name }) => name)
+      expect(names).not.toContain('memory_remember')
+      expect(ctx.tools.get('memory_remember')).toBeUndefined()
     } finally {
       await ctx.fiber.dispose()
       await rm(directory, { recursive: true, force: true })

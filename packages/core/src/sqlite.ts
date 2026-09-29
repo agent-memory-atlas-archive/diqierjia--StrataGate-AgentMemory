@@ -39,6 +39,8 @@ import type {
 } from './types.js';
 import { nowUtc8 } from './time.js';
 import { normalizeStandardEventType } from './events.js';
+import { emptyProfile, isProfileField, PROFILE_FIELDS, PROFILE_PROTECTED_SHORT_FIELDS, profileMaintenanceDue, validateProfile,
+  type PersistentProfile, type ProfileChange, type ProfileChangeSource, type ProfileField } from './profile.js';
 import { searchTokens } from './search.js';
 
 export interface SqliteStorageOptions {
@@ -101,7 +103,7 @@ interface EventRow {
   narrative: string;
   tags_json: string;
   quotes_json: string;
-  source_block_id: string;
+  source_block_id: string | null;
   formed_turn: number | null;
   temporal_json: string;
   scope: MemoryScope;
@@ -237,6 +239,38 @@ interface RawSearchIndexRow {
 }
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS persistent_profile (
+  field TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS persistent_profile_changes (
+  id INTEGER PRIMARY KEY,
+  field TEXT NOT NULL,
+  old_value TEXT NOT NULL,
+  new_value TEXT NOT NULL,
+  source TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  source_message_id TEXT
+) STRICT;
+CREATE TABLE IF NOT EXISTS persistent_profile_maintenance (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_succeeded_at TEXT NOT NULL,
+  input_json TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS persistent_profile_maintenance_baseline (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  started_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS persistent_profile_maintenance_failures (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  input_json TEXT NOT NULL,
+  failure_count INTEGER NOT NULL,
+  next_retry_at TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS memory_spaces (
   namespace TEXT PRIMARY KEY,
   schema_version INTEGER NOT NULL,
@@ -330,6 +364,49 @@ CREATE TABLE IF NOT EXISTS event_sources (
   FOREIGN KEY (namespace, message_id) REFERENCES messages(namespace, id)
 ) STRICT;
 
+-- Agent-recorded memories live in isolated tables that mirror the Event model.
+-- They cite the same provenance blocks but never join the passive events table.
+-- source_block_id is nullable: agent events may cite real open-tail conversation
+-- messages directly, in which case provenance is message-level only.
+CREATE TABLE IF NOT EXISTS agent_events (
+  namespace TEXT NOT NULL,
+  id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  narrative TEXT NOT NULL,
+  tags_json TEXT NOT NULL,
+  quotes_json TEXT NOT NULL,
+  source_block_id TEXT,
+  formed_turn INTEGER,
+  temporal_json TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  criticality TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  status TEXT NOT NULL,
+  superseded_by TEXT,
+  mention_count INTEGER NOT NULL,
+  last_adopted_turn INTEGER NOT NULL,
+  last_retrieved_at TEXT,
+  pinned INTEGER NOT NULL,
+  floor_weight REAL NOT NULL,
+  forced_cap REAL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (namespace, id),
+  FOREIGN KEY (namespace, source_block_id) REFERENCES blocks(namespace, id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS agent_event_sources (
+  namespace TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (namespace, event_id, message_id),
+  FOREIGN KEY (namespace, event_id) REFERENCES agent_events(namespace, id) ON DELETE CASCADE,
+  FOREIGN KEY (namespace, message_id) REFERENCES messages(namespace, id)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS elements (
   namespace TEXT NOT NULL,
   id TEXT NOT NULL,
@@ -356,9 +433,12 @@ CREATE TABLE IF NOT EXISTS element_sources (
   event_id TEXT NOT NULL,
   position INTEGER NOT NULL,
   PRIMARY KEY (namespace, element_id, event_id),
-  FOREIGN KEY (namespace, element_id) REFERENCES elements(namespace, id) ON DELETE CASCADE,
-  FOREIGN KEY (namespace, event_id) REFERENCES events(namespace, id)
+  FOREIGN KEY (namespace, element_id) REFERENCES elements(namespace, id) ON DELETE CASCADE
 ) STRICT;
+-- element_sources.event_id and element_fact_sources.event_id deliberately carry
+-- no FOREIGN KEY: provenance may cite the passive events table or the isolated
+-- agent_events table, and SQLite cannot retarget one constraint across both.
+-- Integrity is enforced by StrataGate.validateReferences on every snapshot load.
 
 CREATE TABLE IF NOT EXISTS element_facts (
   namespace TEXT NOT NULL,
@@ -384,8 +464,7 @@ CREATE TABLE IF NOT EXISTS element_fact_sources (
   event_id TEXT NOT NULL,
   position INTEGER NOT NULL,
   PRIMARY KEY (namespace, fact_id, event_id),
-  FOREIGN KEY (namespace, fact_id) REFERENCES element_facts(namespace, id) ON DELETE CASCADE,
-  FOREIGN KEY (namespace, event_id) REFERENCES events(namespace, id)
+  FOREIGN KEY (namespace, fact_id) REFERENCES element_facts(namespace, id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS extraction_jobs (
@@ -511,6 +590,40 @@ function parseJson<T>(value: string, label: string): T {
   } catch (error) {
     throw new Error(`Invalid JSON in SQLite column ${label}`, { cause: error });
   }
+}
+
+/** Shared row mapper for the passive `events` and isolated `agent_events` tables. */
+function mapEventRows(rows: EventRow[], sourcesByEvent: Map<string, string[]>, table: 'events' | 'agent_events'): EventCard[] {
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    summary: row.summary,
+    narrative: row.narrative,
+    tags: parseJson<string[]>(row.tags_json, `${table}.tags_json`),
+    quotes: parseJson<string[]>(row.quotes_json, `${table}.quotes_json`),
+    sourceMessageIds: sourcesByEvent.get(row.id) ?? [],
+    ...(row.source_block_id === null ? {} : { sourceBlockId: row.source_block_id }),
+    ...(row.formed_turn === null ? {} : { formedTurn: row.formed_turn }),
+    temporal: (() => {
+      const temporal = parseJson<EventTemporal>(row.temporal_json, `${table}.temporal_json`);
+      return { ...temporal, eventType: normalizeStandardEventType(temporal.eventType) };
+    })(),
+    scope: row.scope,
+    criticality: row.criticality,
+    confidence: row.confidence,
+    status: row.status,
+    supersededBy: row.superseded_by,
+    weight: {
+      mentionCount: row.mention_count,
+      lastAdoptedTurn: row.last_adopted_turn,
+      lastRetrievedAt: row.last_retrieved_at,
+      pinned: Boolean(row.pinned),
+      floorWeight: row.floor_weight,
+      forcedCap: row.forced_cap,
+    },
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
 }
 
 function nonEmptyNamespace(namespace: string): string {
@@ -642,36 +755,23 @@ export class SqliteStorage implements StorageAdapter {
     const eventRows = this.database.prepare(`
       SELECT * FROM events WHERE namespace = ? ORDER BY position
     `).all(key) as unknown as EventRow[];
-    const events: EventCard[] = eventRows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      summary: row.summary,
-      narrative: row.narrative,
-      tags: parseJson<string[]>(row.tags_json, 'events.tags_json'),
-      quotes: parseJson<string[]>(row.quotes_json, 'events.quotes_json'),
-      sourceMessageIds: sourcesByEvent.get(row.id) ?? [],
-      sourceBlockId: row.source_block_id,
-      ...(row.formed_turn === null ? {} : { formedTurn: row.formed_turn }),
-      temporal: (() => {
-        const temporal = parseJson<EventTemporal>(row.temporal_json, 'events.temporal_json');
-        return { ...temporal, eventType: normalizeStandardEventType(temporal.eventType) };
-      })(),
-      scope: row.scope,
-      criticality: row.criticality,
-      confidence: row.confidence,
-      status: row.status,
-      supersededBy: row.superseded_by,
-      weight: {
-        mentionCount: row.mention_count,
-        lastAdoptedTurn: row.last_adopted_turn,
-        lastRetrievedAt: row.last_retrieved_at,
-        pinned: Boolean(row.pinned),
-        floorWeight: row.floor_weight,
-        forcedCap: row.forced_cap,
-      },
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    }));
+    const events: EventCard[] = mapEventRows(eventRows, sourcesByEvent, 'events');
+
+    const agentSourceRows = this.database.prepare(`
+      SELECT event_id, message_id, position FROM agent_event_sources
+      WHERE namespace = ? ORDER BY event_id, position
+    `).all(key) as unknown as EventSourceRow[];
+    const agentSourcesByEvent = new Map<string, string[]>();
+    for (const row of agentSourceRows) {
+      const ids = agentSourcesByEvent.get(row.event_id) ?? [];
+      ids.push(row.message_id);
+      agentSourcesByEvent.set(row.event_id, ids);
+    }
+
+    const agentEventRows = this.database.prepare(`
+      SELECT * FROM agent_events WHERE namespace = ? ORDER BY position
+    `).all(key) as unknown as EventRow[];
+    const agentEvents: EventCard[] = mapEventRows(agentEventRows, agentSourcesByEvent, 'agent_events');
 
     const elementSourceRows = this.database.prepare(`
       SELECT element_id, event_id, position FROM element_sources
@@ -827,6 +927,7 @@ export class SqliteStorage implements StorageAdapter {
       blocks,
       summaryJobs,
       events,
+      agentEvents,
       graphNodes,
       graphEdges,
       graphProjectionJobs,
@@ -860,6 +961,127 @@ export class SqliteStorage implements StorageAdapter {
     if (this.closed) return;
     this.database.close();
     this.closed = true;
+  }
+
+  /** Installation-wide state; intentionally has no namespace column. */
+  getPersistentProfile(): PersistentProfile {
+    this.assertOpen();
+    const profile = emptyProfile();
+    const rows = this.database.prepare('SELECT field, value FROM persistent_profile').all() as Array<{ field: string; value: string }>;
+    for (const row of rows) if (isProfileField(row.field)) profile[row.field] = row.value;
+    return profile;
+  }
+
+  getProfileSnapshot(): { profile: PersistentProfile; revisions: Record<ProfileField, number> } {
+    this.assertOpen();
+    const profile = emptyProfile();
+    const revisions = Object.fromEntries((Object.keys(PROFILE_FIELDS) as ProfileField[]).map((field) => [field, 0])) as Record<ProfileField, number>;
+    const rows = this.database.prepare('SELECT p.field, p.value, COALESCE(r.revision, 0) AS revision FROM persistent_profile p LEFT JOIN (SELECT field, MAX(id) AS revision FROM persistent_profile_changes GROUP BY field) r ON r.field = p.field').all() as Array<{ field: string; value: string; revision: number }>;
+    for (const row of rows) if (isProfileField(row.field)) { profile[row.field] = row.value; revisions[row.field] = row.revision; }
+    return { profile, revisions };
+  }
+
+  getProfileChanges(): ProfileChange[] {
+    this.assertOpen();
+    const rows = this.database.prepare('SELECT field, old_value, new_value, source, updated_at, source_message_id FROM persistent_profile_changes ORDER BY id').all() as Array<{
+      field: ProfileField; old_value: string; new_value: string; source: ProfileChangeSource; updated_at: string; source_message_id: string | null;
+    }>;
+    return rows.map((row) => ({ field: row.field, oldValue: row.old_value, newValue: row.new_value,
+      source: row.source, updatedAt: row.updated_at, sourceMessageId: row.source_message_id }));
+  }
+
+  getProfileMaintenanceStartedAt(): string | null {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT started_at FROM persistent_profile_maintenance_baseline WHERE id = 1').get() as { started_at: string } | undefined;
+    return row?.started_at ?? null;
+  }
+
+  getProfileMaintenanceState(): { lastSucceededAt: string; inputJson: string } | null {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT last_succeeded_at, input_json FROM persistent_profile_maintenance WHERE id = 1').get() as { last_succeeded_at: string; input_json: string } | undefined;
+    return row ? { lastSucceededAt: row.last_succeeded_at, inputJson: row.input_json } : null;
+  }
+
+  recordProfileMaintenanceFailure(profile: PersistentProfile, now = Date.now()): void {
+    this.assertOpen();
+    const inputJson = JSON.stringify(profile);
+    const previous = this.database.prepare('SELECT input_json, failure_count, next_retry_at FROM persistent_profile_maintenance_failures WHERE id = 1').get() as { input_json: string; failure_count: number; next_retry_at: string } | undefined;
+    const sameWindow = previous?.input_json === inputJson
+      && !(previous.failure_count >= 3 && now >= Date.parse(previous.next_retry_at));
+    const count = sameWindow ? previous!.failure_count + 1 : 1;
+    const nextRetryAt = new Date(now + (count >= 3 ? 24 * 60 : count * 5) * 60 * 1000).toISOString();
+    this.database.prepare('INSERT INTO persistent_profile_maintenance_failures (id, input_json, failure_count, next_retry_at) VALUES (1, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET input_json = excluded.input_json, failure_count = excluded.failure_count, next_retry_at = excluded.next_retry_at').run(inputJson, count, nextRetryAt);
+  }
+
+  updateProfileField(field: string, value: string, source: ProfileChangeSource, sourceMessageId?: string | null, expectedValue?: string, expectedRevision?: number): { field: ProfileField; value: string; modified: boolean; conflict?: boolean } {
+    this.assertOpen();
+    if (!isProfileField(field)) throw new TypeError(`Unknown Persistent Profile field: ${field}`);
+    if (typeof value !== 'string') throw new TypeError('Persistent Profile value must be a string');
+    if (!['settings', 'user_explicit', 'agent_tool', 'maintenance'].includes(source)) throw new TypeError('Invalid Profile change source');
+    return this.immediateTransaction(() => {
+      const profile = this.getPersistentProfile();
+      const wasNonempty = Object.values(profile).some((entry) => entry.length > 0);
+      const oldValue = profile[field];
+      if (expectedRevision !== undefined) {
+        const row = this.database.prepare('SELECT COALESCE(MAX(id), 0) AS revision FROM persistent_profile_changes WHERE field = ?').get(field) as { revision: number };
+        if (row.revision !== expectedRevision) return { field, value: oldValue, modified: false, conflict: true };
+      }
+      if (expectedValue !== undefined && oldValue !== expectedValue) return { field, value: oldValue, modified: false, conflict: true };
+      if (oldValue === value) return { field, value, modified: false };
+      profile[field] = value;
+      validateProfile(profile);
+      const now = new Date().toISOString();
+      this.writeProfileField(field, oldValue, value, source, sourceMessageId ?? null, now);
+      const isNonempty = Object.values(profile).some((entry) => entry.length > 0);
+      if (!wasNonempty && isNonempty) {
+        this.database.prepare('INSERT INTO persistent_profile_maintenance_baseline (id, started_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET started_at = excluded.started_at').run(now);
+        this.database.prepare('DELETE FROM persistent_profile_maintenance WHERE id = 1').run();
+        this.database.prepare('DELETE FROM persistent_profile_maintenance_failures WHERE id = 1').run();
+      } else if (!isNonempty) {
+        this.database.prepare('DELETE FROM persistent_profile_maintenance_baseline WHERE id = 1').run();
+      }
+      return { field, value, modified: true };
+    });
+  }
+
+  /** Compare the complete input snapshot before writing a model result. */
+  applyProfileMaintenance(expected: PersistentProfile, proposed: PersistentProfile, now = new Date().toISOString()): boolean {
+    this.assertOpen();
+    validateProfile(proposed);
+    if (Object.keys(proposed).length !== Object.keys(PROFILE_FIELDS).length
+      || Object.keys(proposed).some((field) => !isProfileField(field))) throw new TypeError('Maintenance returned unknown or missing Profile fields');
+    for (const field of PROFILE_PROTECTED_SHORT_FIELDS) {
+      if (proposed[field].trim() !== expected[field].trim()) throw new Error(`Profile maintenance changed protected short field ${field}`);
+    }
+    return this.immediateTransaction(() => {
+      const current = this.getPersistentProfile();
+      if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
+      for (const field of Object.keys(PROFILE_FIELDS) as ProfileField[]) {
+        if (current[field] !== proposed[field]) this.writeProfileField(field, current[field], proposed[field], 'maintenance', null, now);
+      }
+      this.database.prepare('INSERT INTO persistent_profile_maintenance (id, last_succeeded_at, input_json) VALUES (1, ?, ?) ON CONFLICT (id) DO UPDATE SET last_succeeded_at = excluded.last_succeeded_at, input_json = excluded.input_json').run(now, JSON.stringify(proposed));
+      this.database.prepare('DELETE FROM persistent_profile_maintenance_failures WHERE id = 1').run();
+      return true;
+    });
+  }
+
+  profileMaintenanceDue(now = Date.now()): boolean {
+    const profile = this.getPersistentProfile();
+    const failed = this.database.prepare('SELECT input_json, failure_count, next_retry_at FROM persistent_profile_maintenance_failures WHERE id = 1').get() as { input_json: string; failure_count: number; next_retry_at: string } | undefined;
+    if (failed?.input_json === JSON.stringify(profile)
+      && now < Date.parse(failed.next_retry_at)) return false;
+    const state = this.getProfileMaintenanceState();
+    if (!profileMaintenanceDue(profile, state?.lastSucceededAt ?? this.getProfileMaintenanceStartedAt(), now)) return false;
+    // A high-capacity profile that could not be compressed is retried after 24h,
+    // or immediately after a new edit, rather than on every worker tick.
+    return !state || now - Date.parse(state.lastSucceededAt) >= 24 * 60 * 60 * 1000
+      || state.inputJson !== JSON.stringify(profile);
+  }
+
+  private writeProfileField(field: ProfileField, oldValue: string, newValue: string, source: ProfileChangeSource, sourceMessageId: string | null, now = new Date().toISOString()): void {
+    this.database.prepare('INSERT INTO persistent_profile (field, value) VALUES (?, ?) ON CONFLICT (field) DO UPDATE SET value = excluded.value').run(field, newValue);
+    this.database.prepare('INSERT INTO persistent_profile_changes (field, old_value, new_value, source, updated_at, source_message_id) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(field, oldValue, newValue, source, now, sourceMessageId);
   }
 
   searchRawMessageIds(
@@ -1070,6 +1292,8 @@ export class SqliteStorage implements StorageAdapter {
       ON CONFLICT (namespace, event_id, message_id) DO UPDATE SET position = excluded.position
     `);
     for (const [eventPosition, event] of snapshot.events.entries()) {
+      // Passive events always carry a provenance block (enforced by
+      // addEventInMemory); only agent events may omit sourceBlockId.
       insertEvent.run(
         namespace,
         event.id,
@@ -1079,7 +1303,54 @@ export class SqliteStorage implements StorageAdapter {
         event.narrative,
         JSON.stringify(event.tags),
         JSON.stringify(event.quotes),
-        event.sourceBlockId,
+        event.sourceBlockId as string,
+        event.formedTurn ?? null,
+        JSON.stringify(event.temporal),
+        event.scope,
+        event.criticality,
+        event.confidence,
+        event.status,
+        event.supersededBy,
+        event.weight.mentionCount,
+        event.weight.lastAdoptedTurn,
+        event.weight.lastRetrievedAt,
+        Number(event.weight.pinned),
+        event.weight.floorWeight,
+        event.weight.forcedCap,
+        event.createdAt,
+        event.updatedAt,
+      );      for (const [position, messageId] of event.sourceMessageIds.entries()) {
+        insertEventSource.run(namespace, event.id, messageId, position);
+      }
+    }
+
+    // Agent-recorded events use delete-then-reinsert so removals are reflected
+    // immediately; the pool is low-volume and FK-ordering is already satisfied
+    // because this runs after the messages upsert.
+    this.database.prepare('DELETE FROM agent_event_sources WHERE namespace = ?').run(namespace);
+    this.database.prepare('DELETE FROM agent_events WHERE namespace = ?').run(namespace);
+    const insertAgentEvent = this.database.prepare(`
+      INSERT INTO agent_events (
+        namespace, id, position, title, summary, narrative, tags_json, quotes_json, source_block_id,
+        formed_turn, temporal_json, scope, criticality, confidence, status, superseded_by,
+        mention_count, last_adopted_turn, last_retrieved_at, pinned, floor_weight, forced_cap,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertAgentEventSource = this.database.prepare(`
+      INSERT INTO agent_event_sources (namespace, event_id, message_id, position) VALUES (?, ?, ?, ?)
+    `);
+    for (const [eventPosition, event] of snapshot.agentEvents.entries()) {
+      insertAgentEvent.run(
+        namespace,
+        event.id,
+        eventPosition,
+        event.title,
+        event.summary,
+        event.narrative,
+        JSON.stringify(event.tags),
+        JSON.stringify(event.quotes),
+        event.sourceBlockId ?? null,
         event.formedTurn ?? null,
         JSON.stringify(event.temporal),
         event.scope,
@@ -1097,7 +1368,7 @@ export class SqliteStorage implements StorageAdapter {
         event.updatedAt,
       );
       for (const [position, messageId] of event.sourceMessageIds.entries()) {
-        insertEventSource.run(namespace, event.id, messageId, position);
+        insertAgentEventSource.run(namespace, event.id, messageId, position);
       }
     }
 
@@ -1375,7 +1646,10 @@ export class SqliteStorage implements StorageAdapter {
             SELECT 1 FROM blocks
             WHERE blocks.namespace = events.namespace
               AND blocks.id = events.source_block_id
-              AND (blocks.thread_id IS NULL OR blocks.thread_id NOT LIKE 'external-import:%')
+              AND (blocks.thread_id IS NULL OR (
+                blocks.thread_id NOT LIKE 'external-import:%'
+                AND blocks.thread_id NOT LIKE 'agent-memory:%'
+              ))
           )
         `);
         const extractionColumns = this.database.prepare("PRAGMA table_info('extraction_jobs')").all() as unknown as Array<{ name: string }>;
@@ -1387,6 +1661,7 @@ export class SqliteStorage implements StorageAdapter {
           this.database.exec('ALTER TABLE messages ADD COLUMN thread_id TEXT');
         }
         this.database.exec(THREAD_INDEXES);
+        this.rebuildLegacyElementSourceForeignKeys();
         this.enableRawSearchFts();
         this.database.prepare('UPDATE memory_spaces SET schema_version = ? WHERE schema_version < ?')
           .run(STRATAGATE_STORAGE_SCHEMA_VERSION, STRATAGATE_STORAGE_SCHEMA_VERSION);
@@ -1395,9 +1670,113 @@ export class SqliteStorage implements StorageAdapter {
     } else if (version === STRATAGATE_STORAGE_SCHEMA_VERSION) {
       this.database.exec(SCHEMA);
       this.database.exec(THREAD_INDEXES);
+      this.rebuildLegacyElementSourceForeignKeys();
       this.enableRawSearchFts();
     }
+    this.immediateTransaction(() => {
+      this.database.exec('DROP INDEX IF EXISTS persistent_profile_single_consent');
+      this.database.exec(`
+        INSERT INTO persistent_profile_maintenance_baseline (id, started_at)
+        SELECT 1, COALESCE(
+          (SELECT MIN(updated_at) FROM persistent_profile_changes WHERE new_value <> ''),
+          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        )
+        WHERE EXISTS (SELECT 1 FROM persistent_profile WHERE value <> '')
+        ON CONFLICT (id) DO NOTHING
+      `);
+      this.database.exec("DELETE FROM persistent_profile_maintenance_baseline WHERE NOT EXISTS (SELECT 1 FROM persistent_profile WHERE value <> '')");
+    });
     this.assertSchemaVersion();
+  }
+
+  /**
+   * v12 widened element provenance to the agent_events pool, but SQLite cannot
+   * retarget an existing FOREIGN KEY. Tables still carrying the legacy
+   * events-only constraint on event_id are rebuilt in place (same columns,
+   * same rows) without it; integrity is enforced by validateReferences.
+   */
+  private rebuildLegacyElementSourceForeignKeys(): void {
+    const legacyTables = (this.database.prepare(`
+      SELECT name, sql FROM sqlite_master
+      WHERE type = 'table' AND name IN ('element_sources', 'element_fact_sources')
+    `).all() as Array<{ name: string; sql: string }>)
+      .filter(({ sql }) => typeof sql === 'string' && sql.includes('REFERENCES events'));
+    if (legacyTables.length === 0) return;
+    // The rebuild runs inside migrate()'s immediate transaction; deferred
+    // enforcement lets the create/copy/drop/rename sequence pass as long as
+    // the final state is consistent, which it is because rows are unchanged.
+    this.database.exec('PRAGMA defer_foreign_keys = ON');
+    if (legacyTables.some(({ name }) => name === 'element_sources')) {
+      this.database.exec(`
+        CREATE TABLE element_sources_rebuild (
+          namespace TEXT NOT NULL,
+          element_id TEXT NOT NULL,
+          event_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          PRIMARY KEY (namespace, element_id, event_id),
+          FOREIGN KEY (namespace, element_id) REFERENCES elements(namespace, id) ON DELETE CASCADE
+        ) STRICT;
+        INSERT INTO element_sources_rebuild (namespace, element_id, event_id, position)
+          SELECT namespace, element_id, event_id, position FROM element_sources;
+        DROP TABLE element_sources;
+        ALTER TABLE element_sources_rebuild RENAME TO element_sources;
+      `);
+    }
+    if (legacyTables.some(({ name }) => name === 'element_fact_sources')) {
+      this.database.exec(`
+        CREATE TABLE element_fact_sources_rebuild (
+          namespace TEXT NOT NULL,
+          fact_id TEXT NOT NULL,
+          event_id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          PRIMARY KEY (namespace, fact_id, event_id),
+          FOREIGN KEY (namespace, fact_id) REFERENCES element_facts(namespace, id) ON DELETE CASCADE
+        ) STRICT;
+        INSERT INTO element_fact_sources_rebuild (namespace, fact_id, event_id, position)
+          SELECT namespace, fact_id, event_id, position FROM element_fact_sources;
+        DROP TABLE element_fact_sources;
+        ALTER TABLE element_fact_sources_rebuild RENAME TO element_fact_sources;
+      `);
+    }
+    // Interim v12 builds declared agent_events.source_block_id NOT NULL; real
+    // open-tail provenance requires a nullable column.
+    const agentColumns = this.database.prepare("PRAGMA table_info('agent_events')").all() as unknown as Array<{ name: string; notnull: number }>;
+    const sourceColumn = agentColumns.find(({ name }) => name === 'source_block_id');
+    if (sourceColumn?.notnull) {
+      this.database.exec(`
+        CREATE TABLE agent_events_rebuild (
+          namespace TEXT NOT NULL,
+          id TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          narrative TEXT NOT NULL,
+          tags_json TEXT NOT NULL,
+          quotes_json TEXT NOT NULL,
+          source_block_id TEXT,
+          formed_turn INTEGER,
+          temporal_json TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          criticality TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          status TEXT NOT NULL,
+          superseded_by TEXT,
+          mention_count INTEGER NOT NULL,
+          last_adopted_turn INTEGER NOT NULL,
+          last_retrieved_at TEXT,
+          pinned INTEGER NOT NULL,
+          floor_weight REAL NOT NULL,
+          forced_cap REAL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (namespace, id),
+          FOREIGN KEY (namespace, source_block_id) REFERENCES blocks(namespace, id)
+        ) STRICT;
+        INSERT INTO agent_events_rebuild SELECT * FROM agent_events;
+        DROP TABLE agent_events;
+        ALTER TABLE agent_events_rebuild RENAME TO agent_events;
+      `);
+    }
   }
 
   private enableRawSearchFts(): void {

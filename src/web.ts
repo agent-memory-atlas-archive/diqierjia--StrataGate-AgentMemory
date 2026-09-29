@@ -4,6 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import {
   DERIVATION_MAX_ATTEMPTS,
   deterministicBlockLayers,
+  effectiveGraphNodeView,
   estimateTokens,
   EXTERNAL_MEMORY_EXPORT_PROMPT_ZH_CN,
   formatRawTranscript,
@@ -137,11 +138,11 @@ export interface WebServerLike {
   }): () => void
 }
 
-function sendJson(res: WebResponse, status: number, body: unknown): void {
+function sendJson(res: WebResponse, status: number, body: unknown, preserveProfileText = false): void {
   res.statusCode = status
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Cache-Control', 'no-store')
-  res.end(JSON.stringify(redactValue(body)))
+  res.end(JSON.stringify(preserveProfileText ? body : redactValue(body)))
 }
 
 function numeric(value: string | null, fallback: number, minimum: number, maximum: number): number {
@@ -606,6 +607,7 @@ async function overview(runtime: StrataGateRuntime, cachedEntries?: readonly Adm
       currentTurn: snapshot.currentTurn,
       blockTurnSize: snapshot.blockTurnSize,
       blockDecayLambda: snapshot.blockDecayLambda,
+      agentMemoryRetrievalWeight: runtime.adminAgentMemoryRetrievalWeight?.() ?? 1,
       blocks: snapshot.blocks.length,
       openTailMessages: snapshot.openTail.length,
       events: snapshot.events.length,
@@ -667,11 +669,13 @@ async function overview(runtime: StrataGateRuntime, cachedEntries?: readonly Adm
 async function updateSettings(runtime: StrataGateRuntime, url: URL): Promise<unknown> {
   const rawTurnSize = url.searchParams.get('blockTurnSize')?.trim()
   const rawLambda = url.searchParams.get('blockDecayLambda')?.trim()
-  if (rawTurnSize === undefined && rawLambda === undefined) {
-    throw new AdminHttpError(400, 'blockTurnSize or blockDecayLambda is required')
+  const rawAgentWeight = url.searchParams.get('agentMemoryRetrievalWeight')?.trim()
+  if (rawTurnSize === undefined && rawLambda === undefined && rawAgentWeight === undefined) {
+    throw new AdminHttpError(400, 'blockTurnSize, blockDecayLambda, or agentMemoryRetrievalWeight is required')
   }
   let turnSize: number | undefined
   let lambda: number | undefined
+  let agentWeight: number | undefined
   if (rawTurnSize !== undefined) {
     const value = Number(rawTurnSize)
     if (!rawTurnSize || !Number.isSafeInteger(value) || value < 1) {
@@ -686,10 +690,58 @@ async function updateSettings(runtime: StrataGateRuntime, url: URL): Promise<unk
     }
     lambda = value
   }
-  const result: { blockTurnSize?: number; blockDecayLambda?: number } = {}
+  if (rawAgentWeight !== undefined) {
+    const value = Number(rawAgentWeight)
+    if (rawAgentWeight === '' || !Number.isFinite(value) || value < 0 || value > 5) {
+      throw new AdminHttpError(400, 'agentMemoryRetrievalWeight must be a finite number between 0 and 5')
+    }
+    agentWeight = value
+  }
+  const result: { blockTurnSize?: number; blockDecayLambda?: number; agentMemoryRetrievalWeight?: number } = {}
   if (turnSize !== undefined) result.blockTurnSize = await runtime.adminSetBlockTurnSize(turnSize)
   if (lambda !== undefined) result.blockDecayLambda = await runtime.adminSetBlockDecayLambda(lambda)
+  if (agentWeight !== undefined) result.agentMemoryRetrievalWeight = runtime.adminSetAgentMemoryRetrievalWeight(agentWeight)
   return result
+}
+
+async function persistentProfile(runtime: StrataGateRuntime, req: WebRequest): Promise<unknown> {
+  if (req.method === 'GET') {
+    const snapshot = runtime.getProfileSnapshot()
+    return { ...snapshot.profile, _revisions: snapshot.revisions }
+  }
+  if (req.method !== 'PATCH') throw new AdminHttpError(405, 'Persistent Profile requires GET or PATCH')
+  let suppliedBody = req.body
+  if (suppliedBody === undefined && typeof req[Symbol.asyncIterator] === 'function') {
+    const chunks: Buffer[] = []
+    let size = 0
+    for await (const chunk of req as AsyncIterable<Uint8Array | string>) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      size += value.length
+      if (size > 16 * 1024) throw new AdminHttpError(413, 'Profile update exceeds 16 KB')
+      chunks.push(value)
+    }
+    suppliedBody = Buffer.concat(chunks).toString('utf8')
+  }
+  let body: unknown = suppliedBody
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body) } catch { throw new AdminHttpError(400, 'Profile update must be valid JSON') }
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new AdminHttpError(400, 'Profile update must be an object')
+  const input = body as Record<string, unknown>
+  if (Object.keys(input).length !== 4 || !Object.hasOwn(input, 'field') || !Object.hasOwn(input, 'value') || !Object.hasOwn(input, 'expectedValue') || !Object.hasOwn(input, 'expectedRevision')
+    || typeof input.field !== 'string' || typeof input.value !== 'string' || typeof input.expectedValue !== 'string'
+    || !Number.isSafeInteger(input.expectedRevision) || (input.expectedRevision as number) < 0) {
+    throw new AdminHttpError(400, 'Profile update requires field, value, expectedValue strings and expectedRevision number')
+  }
+  try {
+    const result = runtime.updatePersistentProfile(input.field, input.value, 'settings', null, input.expectedValue, input.expectedRevision as number)
+    if (result.conflict) throw new AdminHttpError(409, '该项刚刚在其他位置更新')
+    const snapshot = runtime.getProfileSnapshot()
+    return { ...result, snapshot: { ...snapshot.profile, _revisions: snapshot.revisions } }
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof RangeError) throw new AdminHttpError(400, error.message)
+    throw error
+  }
 }
 
 async function feedback(runtime: StrataGateRuntime, req: WebRequest, url: URL): Promise<unknown> {
@@ -1179,17 +1231,38 @@ async function sources(runtime: StrataGateRuntime, url: URL): Promise<unknown> {
     events = [event]
     ids = new Set(event.sourceMessageIds)
   } else if (nodeId) {
-    const node = snapshot.graphNodes.find(({ id }) => id === nodeId)
-    if (!node) throw new AdminHttpError(404, `Unknown graph node: ${nodeId}`)
-    events = snapshot.events.filter(({ id }) => node.sourceEventIds.includes(id))
+    const rawNode = snapshot.graphNodes.find(({ id }) => id === nodeId)
+    if (!rawNode) throw new AdminHttpError(404, `Unknown graph node: ${nodeId}`)
+    const view = effectiveGraphNodeView(rawNode, snapshot.graphEdges, snapshot.events)
+    if (!view) throw new AdminHttpError(404, `Graph node has no retrievable Event evidence: ${nodeId}`)
+    const edges = [...view.currentEdges, ...view.historicalEdges]
+    const relatedNodeIds = new Set([rawNode.id, ...edges.flatMap(({ fromNodeId, toNodeId }) => [fromNodeId, toNodeId])])
+    const nodes = snapshot.graphNodes
+      .filter(({ id }) => relatedNodeIds.has(id))
+      .flatMap((candidate) => effectiveGraphNodeView(candidate, snapshot.graphEdges, snapshot.events)?.node ?? [])
+    const metadataEventIds = [
+      ...(view.node.metadataProvenance?.name ?? []),
+      ...(view.node.metadataProvenance?.aliases ?? []).flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...(view.node.metadataProvenance?.tags ?? []).flatMap(({ sourceEventIds }) => sourceEventIds),
+    ]
+    const eventIds = new Set([
+      ...view.node.sourceEventIds,
+      ...metadataEventIds,
+      ...view.currentFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...view.historicalFacts.flatMap(({ sourceEventIds }) => sourceEventIds),
+      ...edges.flatMap(({ sourceEventIds }) => sourceEventIds),
+    ])
+    events = snapshot.events.filter(({ id }) => eventIds.has(id))
     ids = new Set(events.flatMap(({ sourceMessageIds }) => sourceMessageIds))
-    const edges = snapshot.graphEdges.filter(({ fromNodeId, toNodeId }) => fromNodeId === node.id || toNodeId === node.id)
-    const relatedNodeIds = new Set([node.id, ...edges.flatMap(({ fromNodeId, toNodeId }) => [fromNodeId, toNodeId])])
     return {
       namespace,
-      node,
-      nodes: snapshot.graphNodes.filter(({ id }) => relatedNodeIds.has(id)),
+      node: view.node,
+      nodes,
       edges,
+      currentFacts: view.currentFacts,
+      historicalFacts: view.historicalFacts,
+      currentEdges: view.currentEdges,
+      historicalEdges: view.historicalEdges,
       events: events.map((event) => eventSummary(event)),
       messages: sourceMessages(snapshot, ids),
     }
@@ -1226,6 +1299,7 @@ async function sources(runtime: StrataGateRuntime, url: URL): Promise<unknown> {
     ...(eventId ? {
       relatedNodes: snapshot.graphNodes
         .filter(({ id }) => events[0]?.temporal.participantNodeIds?.includes(id))
+        .flatMap((candidate) => effectiveGraphNodeView(candidate, snapshot.graphEdges, snapshot.events)?.node ?? [])
         .map(({ id, name, type, aliases }) => ({ id, name, type, aliases })),
     } : {}),
     elements: elements.map(elementSummary),
@@ -1411,6 +1485,10 @@ export async function handleAdminRequest(runtime: StrataGateRuntime, req: WebReq
     const path = url.pathname.replace(/\/$/, '')
     if (path === '/api/stratagate/feedback') {
       sendJson(res, 200, await feedback(runtime, req, url))
+    } else if (path === '/api/stratagate/profile') {
+      // This is the authenticated Settings editor. Redacting its editable values
+      // would replace user data with placeholders on the next save.
+      sendJson(res, 200, await persistentProfile(runtime, req), true)
     } else if (path === '/api/stratagate/settings') {
       if (req.method !== 'PATCH') throw new AdminHttpError(405, 'StrataGate settings require PATCH')
       sendJson(res, 200, await updateSettings(runtime, url))
@@ -1446,6 +1524,13 @@ export async function handleAdminRequest(runtime: StrataGateRuntime, req: WebReq
     else if (path === '/api/stratagate/memories') sendJson(res, 200, await memories(runtime, url))
     else if (path === '/api/stratagate/sources') sendJson(res, 200, await sources(runtime, url))
     else if (path === '/api/stratagate/audit') sendJson(res, 200, await audit(runtime, url))
+    else if (path === '/api/stratagate/agent-memories') {
+      const sessionId = url.searchParams.get('session')?.trim() ?? ''
+      sendJson(res, 200, await runtime.adminAgentMemories({
+        ...(sessionId ? { sessionId } : {}),
+        ...(url.searchParams.get('includeArchived') === 'true' ? { includeArchived: true } : {}),
+      }))
+    }
     else throw new AdminHttpError(404, 'Unknown StrataGate admin route')
   } catch (error) {
     const status = error instanceof AdminHttpError ? error.status : 500

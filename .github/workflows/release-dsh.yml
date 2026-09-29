@@ -9,6 +9,16 @@ on:
         description: Exact package version committed on main
         required: true
         type: string
+      allow_unavailable_dsh_0_1_5:
+        description: Explicitly skip the unavailable DSH 0.1.5 smoke and verify 0.1.2 only
+        required: false
+        default: false
+        type: boolean
+      skip_dsh_smoke:
+        description: Explicitly skip DSH runtime smoke after manual acceptance
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -82,12 +92,22 @@ jobs:
           node scripts/verify-package.mjs
       - name: Pack release assets from the checked-out source
         shell: bash
+        env:
+          DSH_VERSION: ${{ inputs.allow_unavailable_dsh_0_1_5 && '0.1.2-rc.1' || '' }}
+          SKIP_DSH_SMOKE: ${{ inputs.skip_dsh_smoke && 'true' || 'false' }}
         run: |
+          if [ -n "$DSH_VERSION" ]; then
+            echo "::warning::DSH 0.1.5 smoke was explicitly waived; verifying $DSH_VERSION only"
+          fi
           versioned="stratagate-dsh-${VERSION}.tgz"
           source_asset="stratagate-dsh-${VERSION}-source.tar.gz"
           npm pack --silent
           test -f "$versioned"
-          node scripts/verify-dsh-install.mjs "$versioned"
+          if [ "$SKIP_DSH_SMOKE" = 'true' ]; then
+            echo "::warning::DSH runtime smoke was explicitly waived after manual acceptance"
+          else
+            node scripts/verify-dsh-install.mjs "$versioned"
+          fi
           git archive --format=tar.gz --prefix="stratagate-dsh-${VERSION}/" --output="$source_asset" "$GITHUB_SHA"
           test -f "$source_asset"
           source_root="stratagate-dsh-${VERSION}"

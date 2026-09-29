@@ -6,7 +6,7 @@ function loadSupportHelpers(stateValues: unknown[] = [], globals: Record<string,
   const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
   const instrumented = source.replace(
     "    exports.name = 'stratagate-dsh'",
-    "    exports.__test = { feedbackDraftMarkdown, restoreFeedbackDraftValues, shouldExpandFeedbackPreview, handleFeedbackIssueResult, issueUrl, buildSupportReport, copyReportAndOpenIssue, downloadSupportReport, readFeedbackDeepLink, readFeedbackNavigationState, readNewFeedbackNavigationState, readGraphNodeNavigationState, readGraphNodeDeepLink, consumeFeedbackDeepLink, consumeGraphNodeDeepLink, feedbackLinkTarget, navigateToFeedback, navigateToGraphNode, installFeedbackLinkNavigation, NodePill, StaticEntityPill, EventMetadata, MemoryWeightTrajectory, ProcessingStatus, MemoryStatusAlert, taskStatus, SettingsPage, SupportPage, ISSUE_URL, ISSUE_BODY_HINT, FEEDBACK_AI_PROMPT }; exports.name = 'stratagate-dsh'",
+    "    exports.__test = { feedbackDraftMarkdown, restoreFeedbackDraftValues, shouldExpandFeedbackPreview, handleFeedbackIssueResult, issueUrl, buildSupportReport, copyReportAndOpenIssue, downloadSupportReport, readFeedbackDeepLink, readFeedbackNavigationState, readNewFeedbackNavigationState, readGraphNodeNavigationState, readGraphNodeDeepLink, consumeFeedbackDeepLink, consumeGraphNodeDeepLink, feedbackLinkTarget, navigateToFeedback, navigateToGraphNode, installFeedbackLinkNavigation, NodePill, StaticEntityPill, EventMetadata, MemoryWeightTrajectory, ProcessingStatus, MemoryStatusAlert, taskStatus, ProfilePage, SettingsPage, SupportPage, ISSUE_URL, ISSUE_BODY_HINT, FEEDBACK_AI_PROMPT, apply }; exports.name = 'stratagate-dsh'",
   )
   let definition: any
   runInNewContext(instrumented, {
@@ -20,7 +20,7 @@ function loadSupportHelpers(stateValues: unknown[] = [], globals: Record<string,
     },
   })
   let stateIndex = 0
-  const React = {
+  const React = (globals.react as any) || {
     createContext: (value: unknown) => ({ Provider: 'provider', value }),
     createElement: (...args: unknown[]) => args,
     Fragment: 'fragment',
@@ -67,21 +67,72 @@ describe('StrataGate Web client contract', () => {
     })
     expect(plugin.inject).toEqual(['slots', 'uiConversation'])
 
-    let registration: any
+    const registrations: any[] = []
     const slots = {
       inject: (_name: string, callback: () => void) => callback(),
-      register: (metadata: unknown, render: unknown) => { registration = { metadata, render } },
+      register: (metadata: any, render: unknown) => {
+        if (metadata.name === 'conversation.chat.turnTail' && !metadata.id) {
+          throw new Error('list slot "conversation.chat.turnTail" requires options.id')
+        }
+        registrations.push({ metadata, render })
+      },
     }
-    plugin.apply({ get: (name: string) => name === 'slots' ? slots : undefined })
+    plugin.apply({ get: (name: string) => name === 'slots' ? slots : name === 'uiConversation' ? { events: { register: () => {} } } : undefined })
+    const tail = registrations.find(({ metadata }) => metadata.name === 'conversation.chat.turnTail')
+    const registration = registrations.find(({ metadata }) => metadata.name === 'settings.section')
+    expect(registrations[0].metadata.name).toBe('settings.section')
+    expect(tail.metadata.id).toBe('stratagate-memory-citations')
     expect(registration.metadata).toMatchObject({ name: 'settings.section', id: 'stratagate-memory' })
     expect(registration.metadata.label()).toBe('StrataGate-AgentMemory')
     expect(typeof registration.render).toBe('function')
   })
 
+  it.each(['get', 'event', 'inject', 'register'] as const)('keeps Settings available when chat %s setup fails', (failure) => {
+    const warnings: unknown[][] = []
+    const { apply } = loadSupportHelpers([], { console: { warn: (...args: unknown[]) => warnings.push(args) } }) as any
+    const registrations: string[] = []
+    let delayedTailSetup: (() => unknown) | undefined
+    const slots = {
+      inject: (name: string, setup: () => unknown) => {
+        if (name === 'conversation.chat.turnTail') {
+          if (failure === 'inject') throw new Error('turnTail slot unavailable')
+          if (failure === 'register') { delayedTailSetup = setup; return }
+        }
+        return setup()
+      },
+      register: (metadata: { name: string }) => {
+        if (metadata.name === 'conversation.chat.turnTail' && failure === 'register') throw new Error('duplicate turnTail id')
+        registrations.push(metadata.name)
+        return () => {}
+      },
+    }
+    const uiConversation = { events: { register: () => {
+      if (failure === 'event') throw new Error('conversation definition unavailable')
+    } } }
+    expect(() => apply({ get: (name: string) => {
+      if (name === 'slots') return slots
+      if (name === 'uiConversation') {
+        if (failure === 'get') throw new Error('conversation service unavailable')
+        return uiConversation
+      }
+      return undefined
+    } })).not.toThrow()
+    expect(registrations).toContain('settings.section')
+    if (failure === 'register') {
+      expect(delayedTailSetup).toBeTypeOf('function')
+      const dispose = delayedTailSetup!()
+      expect(dispose).toBeTypeOf('function')
+      expect(() => (dispose as () => void)()).not.toThrow()
+    }
+    expect(registrations).not.toContain('conversation.chat.turnTail')
+    expect(warnings).toHaveLength(1)
+    expect(String(warnings[0]?.[0])).toContain('memory settings remain available')
+  })
+
   it('declares the supported DSH Conversation package and service contracts', () => {
     const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
     expect(manifest.dsh.client.inject).toEqual(['@deepseek-ai/dsh-client-ui-conversation'])
-    expect(manifest.dshWorkshop.compatibility.dshVersions).toEqual(['0.1.2-rc.1', '0.1.5-rc.1'])
+    expect(manifest.dshWorkshop.compatibility.dshVersions).toEqual(['0.1.2-rc.1', '0.1.5-rc.1', '0.1.6-alpha.1', '0.1.7-rc.1', '0.1.7-rc.2'])
   })
 
   it('parses and consumes only the StrataGate feedback deep link while preserving unrelated URL state', () => {
@@ -338,6 +389,35 @@ describe('StrataGate Web client contract', () => {
     expect(source).not.toContain('sg-compression-panel')
   })
 
+  it('binds display settings through the DSH 0.1.7 config form when available', () => {
+    const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
+    let definition: any
+    runInNewContext(source, {
+      URLSearchParams,
+      window: { __ModuleLoader__: { load: (value: unknown) => { definition = value } } },
+    })
+    const plugin = definition.factory((name: string) => {
+      if (name !== 'react') throw new Error(`unexpected client dependency: ${name}`)
+      return { createContext: (value: unknown) => ({ Provider: 'provider', value }), createElement: (...args: unknown[]) => args, Fragment: 'fragment' }
+    })
+    const registrations: any[] = []
+    const writes: unknown[][] = []
+    const form = { getSnapshot: () => ({ status: 'ready', value: {}, writable: true }), subscribe: () => () => {}, set: (...args: unknown[]) => { writes.push(args) }, unset: (...args: unknown[]) => { writes.push(args) } }
+    const namespaces: string[] = []
+    plugin.apply({ get: (name: string) => name === 'slots'
+      ? { inject: (_name: string, callback: () => void) => callback(), register: (metadata: unknown, render: unknown) => { registrations.push({ metadata, render }) } }
+      : name === 'uiConversation'
+        ? { events: { register: () => {} } }
+        : name === 'configForms'
+          ? { get: (namespace: string) => { namespaces.push(namespace); return form } }
+          : undefined })
+    expect(namespaces).toEqual(['stratagate-memory'])
+    const settings = registrations.find(({ metadata }) => metadata.name === 'settings.section')
+    settings.metadata.inject().setStrataGateStatus(false)
+    settings.metadata.inject().resetEffort()
+    expect(writes).toEqual([['showStrataGateStatus', false], ['structuredReasoningEffort']])
+  })
+
   it('defaults all chat status UI to visible and combines the master and child preferences', () => {
     const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
     const instrumented = source.replace(
@@ -546,6 +626,9 @@ describe('StrataGate Web client contract', () => {
     const renderedTail = JSON.stringify(rendered)
     expect(renderedTail).toContain('本回答采用了 3 条记忆')
     expect(renderedTail).toContain('· 查看检索过程')
+    const listRenderedTail = JSON.stringify(tail.render({ turn: { turn: 7, data: { get: (key: string) => locationData.get(key) } }, seq: 8 }))
+    expect(listRenderedTail).toContain('本回答采用了 3 条记忆')
+    expect(listRenderedTail).toContain('· 查看检索过程')
     expect(JSON.stringify(rendered[3])).not.toContain('pnpm compatibility')
     expect(tail.metadata.select({ turn: { turn: 7, data: { get: (key: string) => locationData.get(key) } }, seq: 2 })).toMatchObject({ turn: 7, citations: [], retrievalGroups: [] })
     const legacyUpdated = conversationDefinition.update({ state: started }, {
@@ -808,7 +891,7 @@ describe('StrataGate Web client contract', () => {
   it('uses the memory-first three-part information architecture', () => {
     const source = readFileSync(new URL('../src/client.js', import.meta.url), 'utf8')
     expect(source).toContain("const [section, setSection] = React.useState('short')")
-    expect(source).toContain("[['short', '短期记忆'], ['long', '长期记忆'], ['more', '更多']]")
+    expect(source).toContain("[['profile', '常驻画像'], ['short', '短期记忆'], ['long', '长期记忆'], ['more', '更多']]")
     expect(source).toContain('块衰减总览')
     expect(source).toContain('开放块 · 未封存')
     expect(source).toContain('距最新封存块')
@@ -926,6 +1009,160 @@ describe('StrataGate Web client contract', () => {
     expect(requests).toEqual([{ url: '/api/stratagate/storage/open-directory', method: 'POST' }])
     expect(copied).toBe(dataDirectory)
     expect(elementProps(tree).find((props) => props.className === 'sg-storage-path')?.title).toBe(dataDirectory)
+  })
+
+  it('shows nine compact Profile rows on the primary page and no Profile editor in Advanced settings', () => {
+    const profile = {
+      userPreferredName: '', assistantPreferredName: '', preferredLanguage: '中文', reasoningLanguage: '', responsePreferences: '',
+      standingInstructions: '', userBackground: '', longTermGoals: '', persistentNotes: '',
+    }
+    const { ProfilePage } = loadSupportHelpers([profile])
+    const profileTree = ProfilePage()
+    expect(deepElementProps(profileTree).filter((props) => props.className === 'sg-profile-row')).toHaveLength(9)
+    expect(deepElementProps(profileTree).filter((props) => props.className === 'sg-profile-group')).toHaveLength(4)
+    expect(deepElementProps(profileTree).filter((props) => String(props.id || '').startsWith('sg-profile-') && props.value !== undefined)).toHaveLength(0)
+    expect(deepElementProps(profileTree).filter((props) => props.className === 'sg-profile-action')).toHaveLength(9)
+    expect(deepElementProps(profileTree).filter((props) => props.className === 'sg-profile-value empty')).toHaveLength(8)
+    expect(JSON.stringify(profileTree)).toContain('默认回答语言')
+    expect(JSON.stringify(profileTree)).toContain('思考过程语言')
+    expect(JSON.stringify(profileTree)).not.toContain('默认使用语言')
+    const settings = loadSupportHelpers().SettingsPage
+    const tree = settings({
+      selected: { schemaVersion: 12, blockTurnSize: 6, blockDecayLambda: 0.3, currentTurn: 0 },
+      namespace: '', dataDirectory: '', onBack: () => {}, setView: () => {},
+      updateSettings: () => Promise.resolve(), savingSettings: false, usePluginSettings: null,
+      setEffort: null, resetEffort: null,
+    })
+    expect(deepElementProps(tree).filter((props) => String(props.id || '').startsWith('sg-profile-'))).toHaveLength(0)
+    expect(elementProps(tree).some((props) => props['aria-labelledby'] === 'sg-profile-title')).toBe(false)
+  })
+
+  it('polls only while visible, keeps an edit draft, and saves only the current field after conflict resolution', async () => {
+    let server = { userPreferredName: '', assistantPreferredName: '', preferredLanguage: '中文', reasoningLanguage: '', responsePreferences: 'A', standingInstructions: '', userBackground: '', longTermGoals: '', persistentNotes: '' }
+    const revisions: Record<string, number> = { preferredLanguage: 0, reasoningLanguage: 0, responsePreferences: 0 }
+    const state: unknown[] = []
+    const refs: Array<{ current: unknown }> = []
+    const effects: Array<() => () => void> = []
+    const timers = new Map<number, () => void>()
+    const writes: Array<{ field: string; value: string; expectedValue: string; expectedRevision: number }> = []
+    let stateIndex = 0
+    let refIndex = 0
+    let nextTimer = 0
+    let mounted = false
+    let reads = 0
+    let changes = 0
+    let onVisibilityChange = () => {}
+    const document = { hidden: false, addEventListener: (_name: string, listener: () => void) => { onVisibilityChange = listener }, removeEventListener: () => {} }
+    const react = {
+      createContext: (value: unknown) => ({ Provider: 'provider', value }),
+      createElement: (...args: unknown[]) => args, Fragment: 'fragment',
+      useState: (initial: unknown) => {
+        const index = stateIndex++
+        if (!(index in state)) state[index] = initial
+        return [state[index], (update: unknown) => {
+          const next = typeof update === 'function' ? (update as (value: unknown) => unknown)(state[index]) : update
+          if (next !== state[index]) changes++
+          state[index] = next
+        }]
+      },
+      useRef: (initial: unknown) => {
+        const index = refIndex++
+        return refs[index] ||= { current: initial }
+      },
+      useEffect: (effect: () => () => void) => { if (!mounted) effects.push(effect) },
+    }
+    const { ProfilePage } = loadSupportHelpers([], {
+      react, document, AbortController,
+      window: { setTimeout: (callback: () => void) => { const id = ++nextTimer; timers.set(id, callback); return id }, clearTimeout: (id: number) => timers.delete(id) },
+      fetch: async (_url: string, options: { method?: string; body?: string } = {}) => {
+        if (options.method === 'PATCH') {
+          const body = JSON.parse(options.body || '{}') as { field: string; value: string; expectedValue: string; expectedRevision: number }
+          writes.push(body)
+          if (server[body.field as keyof typeof server] !== body.expectedValue || revisions[body.field] !== body.expectedRevision) return { ok: false, status: 409, json: async () => ({ error: '该项刚刚在其他位置更新' }) }
+          server = { ...server, [body.field]: body.value }
+          revisions[body.field] = (revisions[body.field] || 0) + 1
+          return { ok: true, json: async () => ({ field: body.field, value: body.value, modified: true, snapshot: { ...server, _revisions: { ...revisions } } }) }
+        }
+        reads++
+        return { ok: true, json: async () => ({ ...server, _revisions: { ...revisions } }) }
+      },
+    })
+    const render = () => { stateIndex = 0; refIndex = 0; return ProfilePage() }
+    const flush = () => new Promise((resolve) => setImmediate(resolve))
+    const tick = async () => { const next = timers.entries().next().value as [number, () => void]; expect(next).toBeDefined(); timers.delete(next[0]); next[1](); await flush() }
+    render()
+    const cleanup = effects[0]!()
+    mounted = true
+    await flush()
+    expect(reads).toBe(1)
+    expect(deepElementProps(render()).filter((props) => props.className === 'sg-profile-row')).toHaveLength(9)
+    changes = 0
+    await tick()
+    expect(changes).toBe(0)
+    server = { ...server, preferredLanguage: 'English' }
+    revisions.preferredLanguage = (revisions.preferredLanguage || 0) + 1
+    await tick()
+    expect(JSON.stringify(render())).toContain('English')
+    const edit = deepElementProps(render()).filter((props) => props.className === 'sg-profile-action')[4]!
+    edit.onClick()
+    let tree = render()
+    const textarea = deepElementProps(tree).find((props) => props.id === 'sg-profile-responsePreferences')!
+    expect(textarea.value).toBe('A')
+    textarea.onChange({ target: { value: 'discarded draft' } })
+    deepElementProps(render()).find((props) => props.className === 'sg-quiet-button')!.onClick()
+    expect(writes).toHaveLength(0)
+    expect(deepElementProps(render()).filter((props) => props.id === 'sg-profile-responsePreferences')).toHaveLength(0)
+    deepElementProps(render()).filter((props) => props.className === 'sg-profile-action')[4]!.onClick()
+    deepElementProps(render()).find((props) => props.id === 'sg-profile-responsePreferences')!.onChange({ target: { value: 'draft C' } })
+    server = { ...server, responsePreferences: 'B', preferredLanguage: 'Français' }
+    revisions.responsePreferences = (revisions.responsePreferences || 0) + 1
+    revisions.preferredLanguage = (revisions.preferredLanguage || 0) + 1
+    await tick()
+    tree = render()
+    expect(deepElementProps(tree).find((props) => props.id === 'sg-profile-responsePreferences')?.value).toBe('draft C')
+    expect(JSON.stringify(tree)).toContain('Français')
+    expect(JSON.stringify(tree)).toContain('该项刚刚在其他位置更新')
+    expect(deepElementProps(tree).find((props) => props.className === 'sg-save-button')?.disabled).toBe(true)
+    deepElementProps(tree).find((props) => props.className === 'sg-profile-action' && props.onClick && !props.disabled && props.type === 'button')?.onClick?.()
+    await flush()
+    tree = render()
+    expect(deepElementProps(tree).find((props) => props.id === 'sg-profile-responsePreferences')?.value).toBe('B')
+    deepElementProps(tree).find((props) => props.id === 'sg-profile-responsePreferences')!.onChange({ target: { value: 'saved C' } })
+    deepElementProps(render()).find((props) => props.className === 'sg-save-button')!.onClick()
+    await flush()
+    expect(writes).toEqual([{ field: 'responsePreferences', value: 'saved C', expectedValue: 'B', expectedRevision: 1 }])
+    expect(server.preferredLanguage).toBe('Français')
+    server = { ...server, reasoningLanguage: '中文' }
+    revisions.reasoningLanguage = (revisions.reasoningLanguage || 0) + 1
+    await tick()
+    expect(JSON.stringify(render())).toContain('中文')
+    deepElementProps(render()).filter((props) => props.className === 'sg-profile-action')[3]!.onClick()
+    expect(deepElementProps(render()).find((props) => props.id === 'sg-profile-reasoningLanguage')?.value).toBe('中文')
+    deepElementProps(render()).find((props) => props.id === 'sg-profile-reasoningLanguage')!.onChange({ target: { value: '日语' } })
+    server = { ...server, reasoningLanguage: 'English' }
+    revisions.reasoningLanguage = (revisions.reasoningLanguage || 0) + 1
+    await tick()
+    tree = render()
+    expect(deepElementProps(tree).find((props) => props.id === 'sg-profile-reasoningLanguage')?.value).toBe('日语')
+    expect(JSON.stringify(tree)).toContain('该项刚刚在其他位置更新')
+    expect(deepElementProps(tree).find((props) => props.className === 'sg-save-button')?.disabled).toBe(true)
+    deepElementProps(tree).find((props) => props.className === 'sg-profile-action' && props.onClick && !props.disabled && props.type === 'button')?.onClick?.()
+    await flush()
+    expect(deepElementProps(render()).find((props) => props.id === 'sg-profile-reasoningLanguage')?.value).toBe('English')
+    deepElementProps(render()).find((props) => props.id === 'sg-profile-reasoningLanguage')!.onChange({ target: { value: '日语' } })
+    deepElementProps(render()).find((props) => props.className === 'sg-save-button')!.onClick()
+    await flush()
+    expect(writes.at(-1)).toEqual({ field: 'reasoningLanguage', value: '日语', expectedValue: 'English', expectedRevision: 2 })
+    expect(server.preferredLanguage).toBe('Français')
+    document.hidden = true
+    onVisibilityChange()
+    expect(timers.size).toBe(0)
+    document.hidden = false
+    onVisibilityChange()
+    await flush()
+    expect(reads).toBeGreaterThan(3)
+    cleanup()
+    expect(timers.size).toBe(0)
   })
 
   it('inherits the resolved light, dark, or system appearance from DSH theme tokens', () => {
@@ -1505,6 +1742,14 @@ describe('StrataGate Web client contract', () => {
     expect(render(overview({ graphMigration: { projected: 64, total: 136, failed: 0, state: 'incomplete', complete: false } })))
       .toContain('知识图谱更新未完成 · 64/136 Events')
     expect(MemoryStatusAlert({ overview: overview(), onOpen: () => {} })).toBeNull()
+
+    const emptyOverview = {
+      events: 0,
+      taskStatus: { blockSummary: empty, eventExtraction: empty, graphProjection: empty },
+      graphMigration: { projected: 0, total: 0, state: 'incomplete', complete: false },
+    }
+    expect(MemoryStatusAlert({ overview: emptyOverview, onOpen: () => {} })).toBeNull()
+    expect(MemoryStatusAlert({ overview: { ...emptyOverview, graphMigration: undefined }, onOpen: () => {} })).toBeNull()
 
     const issueStatus = {
       blockSummary: empty,
