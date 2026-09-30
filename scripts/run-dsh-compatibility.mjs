@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { evaluatePluginCompatibility } from '@deepseek-ai/dsh-app-boot'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'))
 const version = process.env.DSH_VERSION
-if (!version || !manifest.dshWorkshop.compatibility.dshVersions.includes(version)) {
-  throw new Error(`DSH_VERSION must be one of ${manifest.dshWorkshop.compatibility.dshVersions.join(', ')}`)
+const supported020 = version && /^0\.2\.0(?:[-+]|$)/.test(version)
+  && evaluatePluginCompatibility(manifest, {}, version) === undefined
+if (!version || (!manifest.dshWorkshop.compatibility.dshVersions.includes(version) && !supported020)) {
+  throw new Error(`DSH_VERSION must be a recorded verification host (${manifest.dshWorkshop.compatibility.dshVersions.join(', ')}) or any DSH 0.2.0 version (>=0.2.0-0 <0.2.1-0)`)
 }
 
 function run(command, args, cwd, env = {}) {

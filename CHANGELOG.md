@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.93 - Unreleased
+
+- Support the complete DeepSeek Harness `0.2.0` version family: all Alpha, Beta, RC, and stable releases (`>=0.2.0-0 <0.2.1-0`), without listing individual prereleases as installation requirements. Preserve the previously supported DSH versions.
+- Keep the startup guard aligned with the installation range, retaining checks for mixed DSH runtimes and incompatible Cordis/Schemastery patch lines. Use producer-owned message sources throughout DSH `0.2.0` so native V4 Session checkpoints and steering messages remain valid.
+- Pin development dependencies to DSH `0.2.0-rc.2`, add rc.1 and rc.2 to the Linux/Windows compatibility matrix, and update installation verification and version-boundary/V4 persistence regressions.
+- 支持整个 DeepSeek Harness `0.2.0` 版本族，包含全部 Alpha、Beta、RC 和正式版；安装声明与启动检查统一采用 `>=0.2.0-0 <0.2.1-0`，无需为同属 `0.2.0` 的新版本逐个发布插件更新。保留旧宿主支持，修正新版消息来源格式，并更新兼容性测试。
+
 ## 0.2.92 - Unreleased
 
 - Make Event extraction atomic, self-contained, and source-grounded, with descriptions for all eight core fields; remove Event narrative and confidence from extraction, retrieval, projection input, and UI/API output.

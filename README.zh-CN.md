@@ -64,6 +64,8 @@ StrataGate 是 DeepSeek Harness 的跨会话记忆插件。近期对话保留细
 dsh plugin --profile web add stratagate-dsh
 ```
 
+支持整个 DSH `0.2.0` 版本族：全部 Alpha、Beta、RC 和正式版（`>=0.2.0-0 <0.2.1-0`），同时保留此前支持的宿主版本。同属 `0.2.0` 的新版本无需因版本声明而等待插件更新。
+
 重启该 profile，之后照常使用 DSH 即可。StrataGate 会自动记录主 Agent 已完成的对话，在后台生成可搜索的记忆，并在 **DSH 设置 → StrataGate-AgentMemory** 中提供记忆界面。
 
 数据库默认保存在：

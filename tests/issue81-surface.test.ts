@@ -85,11 +85,11 @@ function turnEndAt(session: Session): string {
 }
 
 describe('Issue #81 surface ownership and size', () => {
-  it('encodes a new DSH 0.1.7 checkpoint with a producer-owned source', () => {
+  it.each(['0.1.7-rc.1', '0.2.0-alpha.1', '0.2.0-beta.1', '0.2.0-rc.2', '0.2.0'])('encodes a new DSH %s checkpoint with a producer-owned source', (version) => {
     const session = Session.create('issue81-v4-source' as never)
     const event = session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: '[StrataGate historical conversation block]\nBlock: block-v4' }],
-      source: buildDshMessageSource('0.1.7-rc.1'),
+      source: buildDshMessageSource(version),
     }), { surfaceOp: 'append' })
     expect(() => sessionFormatCatalog.encodeCurrentEvent({
       type: event.type, seq: event.seq, time: event.time, data: event.data,
