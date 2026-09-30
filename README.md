@@ -6,7 +6,7 @@
 
 ### Recent conversations stay detailed. Older memories grow more concise.
 
-StrataGate gradually condenses an AI agent's short-term memory as the conversation progresses, with original details available to expand when needed. Important information becomes Events and a knowledge graph, preserving historical changes and current state for future sessions.
+StrataGate is a cross-session memory plugin for DeepSeek Harness. Recent conversations stay detailed, older conversations become concise, and original records remain available when needed. Important decisions, preferences, and plans become long-term memories for future sessions.
 
 [![CI](https://github.com/diqierjia/StrataGate-AgentMemory/actions/workflows/ci.yml/badge.svg)](https://github.com/diqierjia/StrataGate-AgentMemory/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/stratagate-dsh.svg)](https://www.npmjs.com/package/stratagate-dsh)
@@ -19,11 +19,9 @@ StrataGate gradually condenses an AI agent's short-term memory as the conversati
 
 [中文说明](README.zh-CN.md) · [DeepSeek Harness guide](docs/DSH.md) · [Architecture](docs/ARCHITECTURE.md) · [Full evaluation](docs/EVALUATION.md)
 
-<strong>Current public result:</strong> on LoCoMo `conv-26`, StrataGate averaged <strong>80.46%</strong> across 10 independent Judge runs, versus <strong>63.22%</strong> for Mem0 base. [See the scope and protocol](#experimental-results).
+<strong>Published evaluation:</strong> on 152 questions from one LoCoMo conversation, `conv-26`, each answer received 10 independent evaluations. Mean judged accuracy was <strong>80.46%</strong>, versus <strong>63.22%</strong> for Mem0 base. [See evaluation scope](#experimental-results).
 
 </div>
-
-> **In plain words:** StrataGate keeps recent conversations detailed and gradually condenses older ones as the conversation progresses. Important information becomes Events and a knowledge graph for future sessions. Original records remain available to expand and verify when needed.
 
 ## Why StrataGate?
 
@@ -55,13 +53,6 @@ StrataGate gradually condenses an AI agent's short-term memory as the conversati
 
 Get started: → [Quick start](#quick-start-deepseek-harness)
 
-## Choose your path
-
-| Path | Best for | Start here |
-| --- | --- | --- |
-| **DeepSeek Harness plugin** | Users who want automatic, local-first memory with a visual Memory UI | [Install `stratagate-dsh`](#quick-start-deepseek-harness) |
-| **Core TypeScript library** | Developers building a custom agent or memory integration | [Library entry points](#code-entry-points) |
-
 <a id="quick-start-deepseek-harness"></a>
 
 ## Quick start: DeepSeek Harness
@@ -82,20 +73,7 @@ DSH_HOME/stratagate/memory.db
 
 Removing the plugin does not delete the database. For screenshots, configuration, memory tools, and the exact automatic-capture rules, see the [DeepSeek Harness plugin guide](docs/DSH.md).
 
-## The problem behind the design
-
-As conversations accumulate, an AI agent has to fit the current task, earlier discussions, and lasting information into a limited context window.
-
-Recent discussions often need their full detail. Older conversations can remain as concise summaries and expand when needed. Meanwhile, user preferences, project decisions, and task plans change, making it necessary to distinguish historical records from current state. StrataGate addresses these needs by managing short-term views, long-term updates, retrieval assessment, and usage feedback separately.
-
-| Common problem | How StrataGate handles it |
-| --- | --- |
-| Conversations keep growing, and historical details continue to occupy context | Store each conversation block as L0–L5 views; as more conversation accumulates, older content defaults to a more concise view and expands when needed |
-| Important information is scattered across conversations, and old decisions can be confused with current state | Extract Events with sources and timestamps, preserve history in an event timeline, and organize current state in a knowledge graph |
-| Search finds related content but misses details needed to answer | Assess the evidence through the evidence gate; search again, expand memories, or inspect the source when necessary |
-| A memory keeps gaining weight merely because it is frequently retrieved | Separate retrieval from adoption: long-term weights decay as conversations progress, and only memories recorded as actually used receive reinforcement |
-
-Short-term decay gradually reduces the detail that older conversations contribute to current context. Long-term memory and its weighting mechanism help the agent recall information that remains useful in future sessions. Both retain sources so condensed information can still be traced and checked.
+The command uses the `web` profile; replace `web` if you use another profile. Developers can go directly to [Development and documentation](#code-entry-points).
 
 <a id="how-stratagate-works"></a>
 
@@ -103,53 +81,21 @@ Short-term decay gradually reduces the detail that older conversations contribut
 
 ![Figure 1: StrataGate workflow—memory formation, automatic activation, active retrieval, and evidence assessment](docs/assets/stratagate-overall-flow-en.png)
 
-StrataGate's workflow covers memory formation, recall when answering, and feedback after adoption.
+1. **Save conversations.** Several consecutive turns form a memory Block, stored as six views ranging from an index to the original records.
+2. **Extract lasting information.** Decisions, preferences, plans, and changes become Events with time and source references. The graph builds a current-state view from these Events.
+3. **Recall when answering.** The plugin brings in a small set of relevant memories. When more information is needed, the agent searches Events, the graph, or source messages and assesses whether the evidence is enough.
+4. **Record actual use.** An Event selected as evidence for the final answer counts as a recorded use, called an “adoption” internally, and updates its long-term weight.
 
-### 1. Accumulate conversations into layered short-term memory
-
-Each completed turn and its tool records are saved first. The DeepSeek Harness plugin seals a Block every **6 turns** by default. Users can configure this size; turns below the boundary remain in the current conversation.
-
-Each Block stores six levels of detail, L0–L5, from title indexes and short summaries to complete source records. Decay begins only after background processing finishes: as more Blocks become ready in the same conversation, older Blocks default to shallower views.
-
-This reduces the historical detail presented in context while preserving the complete L5 source records. → [Layered memory](#layered-memory)
-
-### 2. Turn important information into Events and update the knowledge graph
-
-Decisions, preferences, plans, and changes worth keeping become Events. Each Event records content, time, and provenance for future conversations to retrieve.
-
-The knowledge graph then organizes current information and relationships about entities such as people, projects, and tools. New Events can supplement or supersede an earlier state while historical Events and their sources remain available. → [Event cards](#event-cards) · [Current-state graph](#current-state-graph)
-
-### 3. Activate relevant memories before answering and retrieve more when needed
-
-Before each main-model call, the plugin uses the current question and recent conversation to bring in a small set of relevant long-term Events and graph information as background.
-
-The current DSH integration includes at most **4 Events and 4 graph nodes**, subject to a total budget of approximately **900 tokens**. The active conversation's history is supplied through layered Blocks and unsealed turns.
-
-If the available context is sufficient, the agent can answer directly. Otherwise, it uses memory tools to search Events, the graph, or source messages, expanding details as needed.
-
-### 4. Assess whether actively retrieved evidence answers the question
-
-After finding relevant memories, the agent determines whether they answer the actual question: which evidence supports the answer, what is missing, and whether further retrieval is needed.
-
-For example, “the project uses pnpm” answers which tool is currently used, but does not explain why pnpm was originally chosen. The agent should expand the relevant Event or inspect the original discussion.
-
-The evidence gate requires an explicit assessment, while code validates evidence references and protocol constraints. If evidence remains insufficient, the agent continues searching or states that it cannot confirm the answer. → [Evidence gate](#evidence-gate)
-
-### 5. Record adopted evidence and update long-term weights
-
-Search hits and automatic context injection do not reinforce memories.
-
-When the agent determines which evidence supports its final answer, it submits a usage receipt. Events recorded as actually used update their adoption counts and decay anchors. More adoptions lead to slower future decay. Unused search results receive no reinforcement from that selection. → [Use-only reinforcement](#use-only-reinforcement)
-
-For example, a user first decides to use npm, then switches the project to pnpm. StrataGate preserves both decisions and updates the graph's current state. A later question about what the project uses can be answered from that state; questions about when or why the change happened can follow the Event back to the original conversation.
-
-[See a retrieval example that follows an event card back to source messages](#a-real-retrieval-path).
+Automatic recall currently includes at most 4 Events and 4 graph nodes within approximately 900 tokens. Layered Blocks and unsealed turns supply the active conversation's history separately.
 
 ## Core design
 
-StrataGate separately manages conversation detail, long-term information updates, retrieval assessment, and feedback from adopted memories.
+| Mechanism | What changes | What remains |
+| --- | --- | --- |
+| Short-term simplification | Which L0–L5 view an older Block displays by default | Original L5 conversations and tool records |
+| Long-term weight decay | An Event's priority in later recall | Event history and its sources |
 
-**Short-term decay controls how much detail older conversations display. Long-term weights influence information's priority in later recall.** Neither form of decay deletes the original sources.
+Both follow conversation progress: short-term decay uses ready-Block distance, while long-term decay uses turn distance. Elapsed days alone do not trigger either form of decay.
 
 <a id="layered-memory"></a>
 
@@ -173,6 +119,11 @@ Each fully processed Block contains these views:
 | L3 | Deterministically condensed dialogue | Remove standalone fillers from a fixed allowlist; keep only the first duplicate long or code-like paragraph; retain tool names and result summaries |
 | L4 | Near-verbatim dialogue without internal messages | Remove system messages; only trim outer whitespace and add role labels to user and assistant text; retain names and summaries for recognized tool records |
 | L5 | Source messages and tool records | Verify provenance and specific details |
+
+The model summarizes L0–L2. Fixed rules prune fillers, repeated content, and tool records for L3/L4. Short-term decay advances with subsequent ready Blocks, not elapsed days.
+
+<details>
+<summary>Exact pruning rules, decay formula, and level thresholds</summary>
 
 The model produces L0–L2 summaries. L3 and L4 do not use model paraphrasing; code generates them with these fixed rules:
 
@@ -205,6 +156,8 @@ For a Block that starts at L5 and is never expanded again, the default schedule 
 
 The figure illustrates the trend. Actual changes depend on both the decay coefficient and level thresholds; a new Block does not necessarily cause a one-level drop.
 
+</details>
+
 **Expand again when details are needed.**
 
 Suppose an older conversation currently shows only:
@@ -223,7 +176,7 @@ Older conversations can therefore remain lightweight during ordinary use while r
 
 Short-term memory retains a discussion's context. Long-term memory extracts information worth using in future sessions. StrataGate records decisions, preferences, plans, and changes as Events, then uses those Events to organize a knowledge graph.
 
-![Figure 4: Long-term memory updates—Event extraction, historical relationships, and the current-state graph](docs/assets/stratagate-long-term-update-en.png)
+![Figure 3: Long-term memory updates—Event extraction, historical relationships, and the current-state graph](docs/assets/stratagate-long-term-update-en.png)
 
 **Event cards record what happened and retain their sources.**
 
@@ -304,27 +257,13 @@ These checks make retrieval traceable and auditable, but the model can still mis
 
 <a id="use-only-reinforcement"></a>
 
-### 4. Reinforce only memories actually used: more adoptions mean slower future decay
+### 4. Reinforce only memories actually used: repeated use means slower future decay
 
 Long-term memories also decay as conversations progress. Here, the changing quantity is an Event's weight, which participates in later recall and ranking. Unlike a short-term Block, an Event does not move through L0–L5 display levels as its weight decays.
 
-![Figure 3: Long-term memory weights—natural decay, retrieval without reinforcement, and adoption-based reinforcement](docs/assets/stratagate-long-term-weight-en.png)
+![Figure 4: Long-term memory weights—natural decay, retrieval without reinforcement, and adoption-based reinforcement](docs/assets/stratagate-long-term-weight-en.png)
 
-**New Events have an initial weight that decays when they are not adopted.**
-
-The base Event-weight function is:
-
-<p align="center"><strong>w(t,n) = max(floor, e<sup>−λ(n)t</sup>)</strong></p>
-
-<p align="center"><strong>λ(n) = 0.15 / (1 + 1.5 ln(n))</strong></p>
-
-Here:
-
-- `t` is the difference between the current turn and the last adoption turn; new Events start counting from creation;
-- `n` is the internal adoption count, initialized to 1 and incremented for each recorded adoption;
-- `floor` is the minimum weight assigned according to the memory's criticality.
-
-Long-term decay also uses conversation turns rather than elapsed wall-clock time. Lower weight may reduce a memory's priority in later recall, but decay does not delete its historical record.
+An Event not used in answers gradually loses weight as conversation turns accumulate. This can lower its recall priority while its historical record remains available.
 
 **Retrieval does not trigger reinforcement.**
 
@@ -353,49 +292,51 @@ Pinned memories have an effective weight of 1. Superseded Events normally receiv
 
 These weights express a memory-management policy, not factual accuracy. Even high-weight information must be assessed against the current question, current state, and original source.
 
+<details>
+<summary>Long-term weight formula and counters</summary>
+
+**New Events have an initial weight that decays when they are not adopted.**
+
+The base Event-weight function is:
+
+<p align="center"><strong>w(t,n) = max(floor, e<sup>−λ(n)t</sup>)</strong></p>
+
+<p align="center"><strong>λ(n) = 0.15 / (1 + 1.5 ln(n))</strong></p>
+
+Here:
+
+- `t` is the difference between the current turn and the last adoption turn; new Events start counting from creation;
+- `n` is the internal adoption count, initialized to 1 and incremented for each recorded adoption;
+- `floor` is the minimum weight assigned according to the memory's criticality.
+
+Long-term decay also uses conversation turns rather than elapsed wall-clock time. Lower weight may reduce a memory's priority in later recall, but decay does not delete its historical record.
+
+</details>
+
 <a id="external-memory-import"></a>
 
 ## Import memory from another AI
 
-`importExternalMemory()` can migrate a structured memory summary produced by another AI. The core API extracts candidate Events, compares each candidate with a bounded set of existing Events, and lets a model choose one of five actions: add, merge, supersede, mark a conflict, or ignore. Imported text is also retained as a permanent source Block, so every accepted Event remains traceable to the exact import.
+Import a memory summary exported by another AI. StrataGate turns lasting information into Events, compares it with existing memories, and keeps the imported text for source tracing.
 
-The exported prompt and parser use the `stratagate.external-memory.v2` format. Unknown dates remain unknown: the importer preserves the original temporal wording instead of guessing from the current date or message order. See [`docs/EXTERNAL_MEMORY_IMPORT.zh-CN.md`](docs/EXTERNAL_MEMORY_IMPORT.zh-CN.md) for the current integration guide.
+The DSH UI previews the import. Duplicates can be ignored; changes can add, merge, or supersede information, and unresolved differences can be marked as conflicts. Low-confidence decisions allow manual selection, and committed batches can be undone. Earlier Events and their sources remain available.
 
-The DeepSeek Harness UI previews every import, skips exact duplicates deterministically, and asks the configured model to choose add, merge, supersede, conflict, or ignore against Top-K local matches. High-confidence decisions are applied automatically; only low-confidence decisions require confirmation. Each committed batch can be undone from the result screen.
+See the [external-memory import guide](docs/EXTERNAL_MEMORY_IMPORT.zh-CN.md) for formats, prompts, and integration examples.
 
 ## A real retrieval path
 
-One LoCoMo question asks when Caroline gave a speech at a school.
+One LoCoMo question asks when Caroline gave a speech at a school:
 
-The event card found the “school speech,” but the card itself did not contain enough date information:
+1. Event search finds the “school speech” card, but it lacks the date.
+2. The agent judges the evidence partial, identifies the missing date, and searches source messages.
+3. It finds a message dated 2023-06-09 containing “last week.”
+4. The message timestamp gives context for “last week,” providing enough temporal evidence to answer.
 
-```text
-search_events
-        ↓
-Match the “school speech” event card
-        ↓
-The event is relevant, but has no exact date
-verdict = partial
-missing = occurrence date
-        ↓
-search_raw_memory
-        ↓
-Find the source message dated 2023-06-09
-It says “last week”
-        ↓
-Resolve the relative date against the message timestamp
-verdict = sufficient
-        ↓
-Answer
-```
+The Event helps locate the discussion, and the original message and timestamp support verification. The evidence gate requires the agent to identify the gap and keep checking.
 
-In this path:
+<a id="experimental-results"></a>
 
-- the event card provides fast location;
-- the source timestamp and original message provide final verification;
-- the evidence gate requires the agent to identify missing information and keep checking when evidence is insufficient.
-
-## Experimental results
+## Evaluation results and limits
 
 The repository's published R8 comparison uses the LoCoMo conversation sample `conv-26`, containing **419 messages, 35 sessions, and 152 questions** across categories 1–4.
 
@@ -416,18 +357,6 @@ These results cover only `conv-26`, not the full LoCoMo dataset. They do not iso
 
 See the [evaluation document](docs/EVALUATION.md) for the full protocol, per-question results, and Judge variation, and the [machine-readable results](benchmarks/locomo-conv26-r8-final.json) for summary data.
 
-## How these designs emerged
-
-Failures observed across several experimental rounds helped StrataGate refine its memory processing and retrieval strategies:
-
-- **Store temporal information explicitly.** Summaries alone make event dates hard to recover, so event cards distinguish mention time from occurrence time and retain the original temporal wording and source.
-- **Keep evidence assessment short and explicit.** Five fields require the agent to state its evidence, gaps, and next action while allowing code to validate references.
-- **Change retrieval strategy when repeated searches add no information.** When an event card lacks key details, expanding its source or searching original messages is more useful than repeatedly searching the same cards.
-
-The [evaluation document](docs/EVALUATION.md) retains the full R1–R8 history, version differences, and per-question analysis. Multiple changes occurred between rounds; these observations explain design choices but do not independently establish the effect of any single component.
-
-## Current limitations and next steps
-
 In the R8 evaluation above, **31 questions were judged incorrect by a majority of evaluators**. Grouped by the observable failure stage:
 
 | Failure stage | Questions | What it indicates |
@@ -438,44 +367,19 @@ In the R8 evaluation above, **31 questions were judged incorrect by a majority o
 
 Within this evaluation, the results point to a need to improve when retrieval starts and whether retrieved evidence actually answers the question. The evidence gate constrains references and assessment procedures, but cannot guarantee the model's semantic judgment or final answer.
 
-Further validation will focus on:
+See the [full evaluation](docs/EVALUATION.md) for R1–R8 design history, per-question analysis, and further validation.
 
-1. Holding the model and memory state fixed while ablating short-term decay and key retrieval mechanisms, comparing accuracy, context use, and call costs.
-2. Supplying known-correct source evidence directly to distinguish retrieval failures from reasoning errors that persist despite correct evidence.
-3. Repeating the same protocol on more conversation samples before extending it to the full LoCoMo dataset.
+## Scope and costs
 
-## Current status
+Memory can be scoped to a project, session, or globally. The graph UI supports inspecting information, relationships, and sources; collaborative editing and cross-product cloud synchronization are not its primary functions.
 
-StrataGate provides an installable DeepSeek Harness plugin, with memory management implemented through a shared TypeScript core engine.
+Layered views reduce historical context supplied when answering. Background summarization, Event extraction, and graph updates still call models, so smaller answer context does not automatically mean fewer total tokens or lower costs. Evaluate background usage especially in sessions with extensive tool records.
 
-Current functionality includes:
+Public APIs, model integration, and evaluation coverage are evolving. Custom integrations should pin a version and validate their use cases. The evidence gate requires explicit support but cannot guarantee correct judgments or answers.
 
-- automatic capture of completed conversations and tool records;
-- L0–L5 short-term memory views, display decay, and on-demand expansion;
-- Events with provenance and time, plus a knowledge graph updated from those Events;
-- automatic activation of relevant long-term memories, active search, and source lookup;
-- retrieval-batch management, evidence assessment, and usage receipts;
-- long-term weight decay, adoption-based reinforcement, and memory import from other AIs.
+<a id="code-entry-points"></a>
 
-The repository includes automated tests, experiment records, and traceable evaluation results. Public APIs, model integration, and evaluation coverage are still evolving. Custom integrations should pin a version and validate behavior for their own use cases.
-
-The standard `StrataGate.open()` entry point uses SQLite persistence; `StrataGate.inMemory()` explicitly selects temporary operation or testing. The storage adapter supports interruption recovery and consistency checks. See the [architecture document](docs/ARCHITECTURE.md) for its constraints.
-
-## When StrataGate is a good fit
-
-StrataGate suits agent workflows that need continuity across extended conversations while controlling the context occupied by history. For example:
-
-- **Sustained project work.** Recent discussions stay detailed; older discussions become concise and can expand when the reasoning behind a decision matters.
-- **Continuing work across sessions.** Retrieve project decisions, user preferences, plans, and unfinished work in a new conversation.
-- **Tracking changes.** Understand both current project state and historical changes without mistaking an earlier decision for the current one.
-- **Verifying memory sources.** Trace Events and graph information back to original records when an answer depends on dates, exact wording, or tool results.
-- **Migrating existing memories.** Turn information exported by another AI into Events while retaining the imported source text.
-
-Memory can be organized by project, session, or global scope. The knowledge-graph UI primarily supports viewing current information, relationships, and sources; collaborative editing and cloud synchronization across products are not its primary functions.
-
-DeepSeek Harness users can install the plugin through the [quick start](#quick-start-deepseek-harness). See the [plugin guide](docs/DSH.md) for configuration, memory tools, and recovery behavior.
-
-## Code entry points
+## Development and documentation
 
 This section is for developers. DeepSeek Harness users can follow the [quick start](#quick-start-deepseek-harness) without building the repository themselves.
 
@@ -493,36 +397,6 @@ npm test
 npm run build
 ```
 
-The main code entry points are:
-
-| Entry point | Contents |
-| --- | --- |
-| [Core-engine example](packages/core/examples/basic.ts) | Minimal integration example |
-| [Core state and lifecycle](packages/core/src/store.ts) | Blocks, Events, graph, import, retrieval, and adoption records |
-| [Layering and decay](packages/core/src/blocks.ts) | L0–L5 levels, display decay, and deterministic pruning |
-| [Long-term weights](packages/core/src/weights.ts) | Event decay and minimum-weight calculation |
-| [Event types](packages/core/src/events.ts) | Event-type normalization |
-| [Knowledge graph](packages/core/src/graph.ts) | Provenance checks, graph updates, and state maintenance |
-| [Retrieval ranking](packages/core/src/search.ts) | BM25 ranking and RRF fusion |
-| [Evidence assessment](packages/core/src/retrieval.ts) | Assessment structure and reference constraints |
-| [External-memory import](packages/core/src/external-memory.ts) | Import formats, prompts, and parsing |
-| [Legacy Element-card support](packages/core/src/elements.ts) | Element projection and historical time views |
-
-In persistent mode, `recordMemoryUse()` requires a nonempty, stable `receiptId`. Reuse that ID when retrying the same adoption operation to avoid duplicate reinforcement. For example:
-
-```ts
-await memory.recordMemoryUse(
-  { eventIds: usedEventIds },
-  { receiptId: usageReceiptId },
-);
-```
-
-Here, `usedEventIds` contains the Events the application selected for the answer, and `usageReceiptId` identifies that adoption operation. The DSH plugin handles this through memory tools and its batch protocol; plugin users do not call this API manually.
-
-The core example demonstrates API integration. See the [evaluation document](docs/EVALUATION.md) for the model calls, tool loop, and Judge protocol used in the full evaluation.
-
-## Documentation and reproduction
-
 | Resource | Contents |
 | --- | --- |
 | [DeepSeek Harness guide](docs/DSH.md) | Installation, configuration, UI, memory tools, and recovery |
@@ -532,17 +406,9 @@ The core example demonstrates API integration. See the [evaluation document](doc
 | [Evaluation summary data](benchmarks/locomo-conv26-r8-final.json) | Published results, statistics, and artifact information |
 | [Core-engine example](packages/core/examples/basic.ts) | Minimal API integration example |
 
-## Repository layout
+The core implementation is in `packages/core/`; the DSH adapter is in `src/`. See [blocks.ts](packages/core/src/blocks.ts) for layered views and [weights.ts](packages/core/src/weights.ts) for long-term weights.
 
-```text
-src/                    DeepSeek Harness Host and Web client adapter
-tests/                  DeepSeek Harness integration tests
-cordis.patch.yml        Root-level DSH bundle manifest
-packages/core/          Shared memory engine, core tests, and example
-integrations/workbuddy/ WorkBuddy Host Adapter and MCP integration
-docs/                   DSH usage, architecture, and evaluation
-benchmarks/             Machine-readable experiment results
-```
+`StrataGate.open()` uses SQLite; `StrataGate.inMemory()` is for temporary runs and tests. In persistent mode, `recordMemoryUse()` requires a stable `receiptId`. Reuse it when retrying the same recorded use to prevent duplicate reinforcement. See the [architecture guide](docs/ARCHITECTURE.md).
 
 ## Contributing
 

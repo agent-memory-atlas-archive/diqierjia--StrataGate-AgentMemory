@@ -179,6 +179,38 @@ Criticality floors in the reference implementation are:
 
 A pinned event has effective weight 1. A superseded event is capped at 0.1. Forgotten and archived events have effective weight 0.
 
+### Recording final-answer use with `recordMemoryUse()`
+
+Call this API after the application has selected the Events used as evidence for an answer. Do not pass every search hit or every memory injected into context. The core method records the application's selection; it does not independently inspect the answer text or perform the retrieval sufficiency assessment. The DSH tool protocol supplies those checks before recording use.
+
+```ts
+// memory is an opened StrataGate instance.
+// Persist these values with the answer operation before attempting the write.
+const usedEventIds = ['event-selected-for-this-answer']; // Existing Event IDs.
+const usageReceiptId = 'answer:stable-answer-id:memory-use';
+
+await memory.recordMemoryUse(
+  { eventIds: usedEventIds },
+  { receiptId: usageReceiptId },
+);
+
+// A retry of the same operation uses the same IDs and receipt.
+await memory.recordMemoryUse(
+  { eventIds: usedEventIds },
+  { receiptId: usageReceiptId },
+);
+```
+
+Replace the example identifiers with the application's actual Event IDs and a stable answer-operation ID. A new answer operation needs a new receipt; a retry must reuse the original receipt rather than generate a new UUID.
+
+- Persistent mode requires a nonempty `receiptId`; whitespace-only IDs are rejected.
+- Reusing a receipt with the same Event IDs, Element IDs, and audit metadata returns without reinforcing again.
+- Reusing it with different IDs or audit metadata throws an error. Keep the original payload when retrying; do not reuse the receipt for a revised evidence selection.
+- Within one call, duplicate IDs are deduplicated. Missing, forgotten, or archived Events are skipped, so callers should submit known eligible IDs.
+- Each eligible Event's internal `mentionCount` increases once and its `lastAdoptedTurn` moves to the current turn. The field counts recorded use, despite its historical name; retrieval alone does not increment it.
+
+`StrataGate.inMemory()` allows calls without a receipt, but these calls have no receipt-based retry deduplication. DSH users do not need to call this API manually. See [the implementation](../packages/core/src/store.ts) for `MemoryUseRefs`, `RecordMemoryUseOptions`, and receipt conflict handling.
+
 ## Retrieval assessment contract
 
 The assessment contract is deliberately small:
