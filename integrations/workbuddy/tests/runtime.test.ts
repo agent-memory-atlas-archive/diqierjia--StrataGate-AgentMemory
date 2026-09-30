@@ -122,6 +122,7 @@ describe('WorkBuddyRuntime', () => {
   })
 
   it('generates Events and Elements in the background with a configured model', async () => {
+    let previousTargetMessageId = 'non-target-message';
     const model = createServer((request, response) => {
       const chunks: Buffer[] = []
       request.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
@@ -138,23 +139,25 @@ describe('WorkBuddyRuntime', () => {
             l2Keypoints: ['Deployment target: Singapore'],
             shouldExtract: true,
           }
-        } else if (system.startsWith('Extract only')) {
+        } else if (system.startsWith('You are the StrataGate Event Extractor')) {
           result = {
             shouldExtract: true,
             reason: 'A durable project decision was found.',
             events: [{
               title: 'Deployment target selected',
               summary: 'The deployment target is Singapore.',
-              narrative: 'The user selected Singapore as the deployment target.',
               tags: ['deployment', 'singapore'],
               quotes: ['Our deployment target is Singapore.'],
               sourceMessageIds: [payload.target.messages[0].id],
               temporal: { eventType: 'decision' },
               scope: 'project',
               criticality: 'routine',
-              confidence: 0.98,
+            }, {
+              title: 'Invalid mixed-source Event', summary: 'This Event must be rejected.',
+              sourceMessageIds: [payload.target.messages[0].id, previousTargetMessageId],
             }],
           }
+          previousTargetMessageId = payload.target.messages[0].id
         } else {
           result = {
             reason: 'Project state updated from the deployment decision.',
@@ -213,14 +216,14 @@ const system = args[args.indexOf('--system-prompt') + 1]
 let result
 if (system.startsWith('You compress')) {
   result = { l0Title: 'Deployment', l0Tags: ['deployment'], l1Summary: 'Deployment summary.', l2Keypoints: ['Singapore'], shouldExtract: true }
-} else if (system.startsWith('Extract only')) {
+} else if (system.startsWith('You are the StrataGate Event Extractor')) {
   result = {
     shouldExtract: true,
     reason: 'durable decision',
     events: [{
-      title: 'Deployment target selected', summary: 'Singapore selected.', narrative: 'Singapore is the target.',
+      title: 'Deployment target selected', summary: 'Singapore selected.',
       tags: ['deployment'], quotes: ['Singapore'], sourceMessageIds: [payload.target.messages[0].id],
-      temporal: { eventType: 'decision' }, scope: 'project', criticality: 'routine', confidence: 0.99
+      temporal: { eventType: 'decision' }, scope: 'project', criticality: 'routine'
     }]
   }
 } else {
