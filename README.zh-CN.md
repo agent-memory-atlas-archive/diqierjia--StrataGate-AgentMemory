@@ -11,12 +11,9 @@ StrataGate 是 DeepSeek Harness 的跨会话记忆插件。近期对话保留细
 [![CI](https://github.com/diqierjia/StrataGate-AgentMemory/actions/workflows/ci.yml/badge.svg)](https://github.com/diqierjia/StrataGate-AgentMemory/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/stratagate-dsh.svg)](https://www.npmjs.com/package/stratagate-dsh)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/diqierjia/StrataGate-AgentMemory?style=social&label=Stars)](https://github.com/diqierjia/StrataGate-AgentMemory/stargazers)
-[![dshfind: StrataGate-AgentMemory — A 73](https://dshfind.com/api/badge/diqierjia/StrataGate-AgentMemory?lang=en)](https://dshfind.com/en/plugins/diqierjia/StrataGate-AgentMemory?ref=badge)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6.svg)](https://www.typescriptlang.org/)
 [![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
 [![欢迎贡献](https://img.shields.io/badge/%E6%AC%A2%E8%BF%8E%E8%B4%A1%E7%8C%AE-brightgreen.svg)](CONTRIBUTING.zh-CN.md)
-
-[![dshfind](https://dshfind.com/api/card/diqierjia/StrataGate-AgentMemory?lang=zh)](https://dshfind.com/zh/plugins/diqierjia/StrataGate-AgentMemory?ref=badge)
 
 [English](README.md) · [DeepSeek Harness 插件说明](docs/DSH.zh-CN.md) · [架构说明](docs/ARCHITECTURE.md) · [完整评测](docs/EVALUATION.md)
 
@@ -31,8 +28,6 @@ StrataGate 是 DeepSeek Harness 的跨会话记忆插件。近期对话保留细
    (1) **近期详细，远期简略。** 同一段对话保存为 L0–L5 六种详细程度的视图。随着后续对话积累，较早的记忆逐渐从完整对话变为关键事实、简短摘要和标题索引，减少历史内容对上下文的占用。→ [分层记忆](#layered-memory)
 
    (2) **展示变简，原始记录保留。** 完整的 L5 原始消息与工具记录始终保存。需要核对细节时，Agent 可以按需展开，找回当时的原话和上下文。→ [分层记忆](#layered-memory)
-
-   ![短期记忆动画：Block 从 L5 逐渐简化到 L0，留在上下文中，并在需要时展开](docs/assets/short-term-memory-explainer-zh.gif)
 
 2. **长期记忆：用事件线保留历史，用知识图谱整理当前状态。**
 
@@ -121,7 +116,7 @@ DeepSeek Harness 插件默认每 **6 轮**完整对话封存一个 Block，一�
 | L4 | 去除内部记录的近原文对话 | 过滤 system 消息；用户和助手正文只裁剪首尾空白并添加角色标签；可识别的工具记录保留名称和结果摘要 |
 | L5 | 原始消息与工具记录 | 查证来源及具体细节 |
 
-L0–L2 由模型概括；L3/L4 按固定规则删减寒暄、重复内容和工具记录，具体规则见下方。短期衰减按后续就绪 Block 的数量推进，不按现实中经过的天数计算。
+L0–L2 由模型概括；L3/L4 由固定规则生成：L3 删除独立寒暄和重复长文本，L4 则尽量保留原话；两者都会精简可识别的工具记录。具体规则见下方。短期衰减按后续就绪 Block 的数量推进，不按现实中经过的天数计算。
 
 <details>
 <summary>具体精简规则、衰减公式与层级阈值</summary>
@@ -418,12 +413,6 @@ npm run build
 欢迎各种形式的贡献：修复问题、完善文档、增加集成，或探索更好的记忆与检索方案都可以。
 
 请先阅读 [`CONTRIBUTING.zh-CN.md`](CONTRIBUTING.zh-CN.md)，其中包含 monorepo 开发环境、检查与测试命令、适合参与的方向，以及提交 Pull Request 的建议。如果还不确定一个想法是否适合项目，建议先[创建 Issue](https://github.com/diqierjia/StrataGate-AgentMemory/issues)，再投入较大的改动。
-
-## 贡献者
-
-<a href="https://github.com/diqierjia/StrataGate-AgentMemory/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=diqierjia/StrataGate-AgentMemory" alt="StrataGate 贡献者" />
-</a>
 
 ## 许可证
 
