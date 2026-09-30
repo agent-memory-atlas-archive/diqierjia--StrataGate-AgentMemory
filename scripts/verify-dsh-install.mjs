@@ -278,7 +278,7 @@ try {
     const config = run(process.execPath, [cli, '--profile', 'web', '--dump-config'], root, dshEnv)
     assert(config.includes("sessionRoot: !!js dshHomePath('sessions')"), `${version}: sessionRoot was not wired to the host DSH_HOME`)
     await smokeWeb(cli, root, dshEnv, version)
-    if (version === '0.1.6-alpha.1' || dsh07) {
+    if (version === '0.1.6-alpha.1' || modernHost) {
       await verifyPluginFailureIsDetected(cli, root, dshEnv, version, profile)
     }
     const projectId = process.platform === 'win32' ? '--C-redacted-workspace--' : '--redacted-workspace--'

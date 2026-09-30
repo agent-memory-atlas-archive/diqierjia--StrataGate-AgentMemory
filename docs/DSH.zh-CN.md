@@ -191,6 +191,8 @@ config:
 
 开发依赖固定为 DSH `0.2.0-rc.2`，保证检查可复现。发布门禁配置在 Node `24`、Linux 和 Windows 上验证此前列出的旧宿主，以及 `0.2.0-rc.1` 和 `0.2.0-rc.2`。`dshWorkshop.compatibility.dshVersions` 记录用于验证的具体宿主；安装兼容性由完整的 peer 版本范围声明，测试版本列表不会限制新的 `0.2.0` 更新。
 
+在 DSH `0.2.0` 上，由宿主提供的 `dsh-session-format`、`dsh-session-format-catalog` 和 `dsh-session-format-v0-to-v1` 也必须与核心 DSH 包版本一致。Session Format 包混装或缺失时，插件会在旧会话迁移前拒绝启动；早期宿主保留原有兼容规则。
+
 DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于受支持的 DSH `0.1.5`、`0.1.6`、`0.1.7` 和 `0.2.0`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
 
 DSH 0.1.7 和 0.2.0 将插件配置保存在 profile 中，并通过配置表单提供实时控制。StrataGate 聊天界面中的设置在 0.1.7 和 0.2.0 使用配置表单，在之前受支持的宿主上继续使用旧设置服务。调整结构化任务的推理力度后，后续记忆模型调用会直接使用新值，无需重启插件。

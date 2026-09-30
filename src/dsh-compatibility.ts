@@ -3,7 +3,7 @@ import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
 
-const RUNTIME_PACKAGES = [
+const CORE_RUNTIME_PACKAGES = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-agent-default-model',
   '@deepseek-ai/dsh-client-ui-conversation',
@@ -15,6 +15,14 @@ const RUNTIME_PACKAGES = [
   '@deepseek-ai/dsh-tools',
   '@deepseek-ai/schemastery',
 ] as const
+
+const SESSION_FORMAT_PACKAGES = [
+  '@deepseek-ai/dsh-session-format',
+  '@deepseek-ai/dsh-session-format-catalog',
+  '@deepseek-ai/dsh-session-format-v0-to-v1',
+] as const
+
+const RUNTIME_PACKAGES = [...CORE_RUNTIME_PACKAGES, ...SESSION_FORMAT_PACKAGES] as const
 
 const SUPPORTED_RUNTIME_FAMILIES = [
   {
@@ -170,16 +178,21 @@ function isCompatiblePatch(version: string, major: number, minor: number, minimu
  */
 export function classifyDshRuntime(packageVersions: DshRuntimePackageVersions): DshRuntimeCompatibility {
   const family = SUPPORTED_RUNTIME_FAMILIES.find(({ versions }) => (
-    RUNTIME_PACKAGES.every((name) => packageVersions[name] === versions[name])
+    CORE_RUNTIME_PACKAGES.every((name) => packageVersions[name] === versions[name])
   ))
   if (family) return { cliVersion: family.cli, packageVersions }
 
   const dshVersion = packageVersions['@deepseek-ai/dsh-session']
-  const sameDshFamily = RUNTIME_PACKAGES
+  const sameDshFamily = CORE_RUNTIME_PACKAGES
     .filter((name) => name.startsWith('@deepseek-ai/dsh-'))
     .every((name) => packageVersions[name] === dshVersion)
+  // Preserve older host rules; the complete 0.2.0 runtime also owns the codecs
+  // used by startup migration and native Session checkpoint persistence.
+  const sameSessionFormatFamily = !isDsh020Version(dshVersion)
+    || SESSION_FORMAT_PACKAGES.every((name) => packageVersions[name] === dshVersion)
   if ((/^0\.1\.7-rc\.[1-9]\d*$/.test(dshVersion) || dshVersion === '0.1.7' || isDsh020Version(dshVersion))
     && sameDshFamily
+    && sameSessionFormatFamily
     && isCompatiblePatch(packageVersions['@deepseek-ai/cordis'], 4, 0, 4)
     && isCompatiblePatch(packageVersions['@deepseek-ai/schemastery'], 3, 18, 4)) {
     return { cliVersion: dshVersion, packageVersions }

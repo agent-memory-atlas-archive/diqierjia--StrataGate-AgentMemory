@@ -4,6 +4,7 @@ import { evaluatePluginCompatibility } from '@deepseek-ai/dsh-app-boot'
 import {
   buildDshReplaceSurfaceOp,
   buildDshMessageSource,
+  assertCompatibleDshRuntime,
   classifyDshRuntime,
   type DshRuntimePackageVersions,
 } from '../src/dsh-compatibility.js'
@@ -23,6 +24,9 @@ function versions(version: string): DshRuntimePackageVersions {
     '@deepseek-ai/dsh-llm': version,
     '@deepseek-ai/dsh-native-command': version,
     '@deepseek-ai/dsh-session': version,
+    '@deepseek-ai/dsh-session-format': version === '0.1.2-rc.1' ? '<missing>' : version,
+    '@deepseek-ai/dsh-session-format-catalog': version === '0.1.2-rc.1' ? '<missing>' : version,
+    '@deepseek-ai/dsh-session-format-v0-to-v1': version === '0.1.2-rc.1' ? '<missing>' : version,
     '@deepseek-ai/dsh-settings': version,
     '@deepseek-ai/dsh-system-prompt': version,
     '@deepseek-ai/dsh-tools': version,
@@ -105,6 +109,46 @@ describe('DSH runtime compatibility', () => {
     ]) {
       expect(() => classifyDshRuntime({ ...versions('0.2.0-rc.2'), ...change })).toThrow(/unsupported or mixed core runtime/)
     }
+  })
+
+  const sessionFormatPackages = [
+    '@deepseek-ai/dsh-session-format',
+    '@deepseek-ai/dsh-session-format-catalog',
+    '@deepseek-ai/dsh-session-format-v0-to-v1',
+  ] as const
+
+  it('includes installed Session Format peers in the runtime compatibility report', () => {
+    const installed = assertCompatibleDshRuntime()
+    for (const name of sessionFormatPackages) {
+      expect(installed.packageVersions[name]).toBeTypeOf('string')
+      if (installed.cliVersion.startsWith('0.2.0')) {
+        expect(installed.packageVersions[name]).toBe(installed.packageVersions['@deepseek-ai/dsh-session'])
+      }
+    }
+  })
+
+  it.each(sessionFormatPackages)('rejects mixed DSH 0.2.0 Session Format peer %s', (name) => {
+    for (const version of ['0.2.0-rc.1', '0.1.7-rc.2']) {
+      const mixed = { ...versions('0.2.0-rc.2'), [name]: version }
+      expect(() => classifyDshRuntime(mixed)).toThrow(/unsupported or mixed core runtime/)
+      expect(() => classifyDshRuntime(mixed)).toThrow(`${name}@${version}`)
+    }
+  })
+
+  it.each(sessionFormatPackages)('rejects a missing DSH 0.2.0 Session Format peer %s', (name) => {
+    const missing = { ...versions('0.2.0-rc.2'), [name]: '<missing>' }
+    expect(() => classifyDshRuntime(missing)).toThrow(`${name}@<missing>`)
+    const omitted: Partial<DshRuntimePackageVersions> = { ...versions('0.2.0-rc.2') }
+    delete omitted[name]
+    expect(() => classifyDshRuntime(omitted as DshRuntimePackageVersions)).toThrow(/unsupported or mixed core runtime/)
+  })
+
+  it.each(['0.1.2-rc.1', '0.1.5-rc.2', '0.1.6-alpha.1', '0.1.7-rc.1', '0.1.7-rc.2', '0.1.7-rc.3', '0.1.7'])('preserves older runtime rules when Session Format peers are absent on DSH %s', (version) => {
+    const older = {
+      ...versions(version),
+      ...Object.fromEntries(sessionFormatPackages.map((name) => [name, '<missing>'])),
+    }
+    expect(classifyDshRuntime(older).cliVersion).toBe(version === '0.1.5-rc.2' ? '0.1.5-rc.1' : version)
   })
 
   it('rejects a future runtime with an incompatible Cordis or Schemastery version', () => {
