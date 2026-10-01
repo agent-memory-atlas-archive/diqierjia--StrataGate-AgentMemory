@@ -115,7 +115,7 @@ describe.each(['legacy', 'flat'])('DSH answer-tail timing (%s)', (format) => {
   it.each([4, 8])('renders a result at seq %i without a subsequent Turn', (resultSeq) => {
     const dshChatPackage = JSON.parse(readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/package.json', import.meta.url), 'utf8'))
     const dshChat = readFileSync(new URL('../node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js', import.meta.url), 'utf8')
-    expect(dshChatPackage.version).toBe('0.1.7-rc.2')
+    expect(dshChatPackage.version).toBe('0.2.0-rc.2')
     expect(dshChat).toMatch(/"conversation\.chat\.turnTail":\s*\{\s*kind: "list"/)
     expect(dshChat).toContain('seq: closing?.finalNode.seq ?? data.seq')
 

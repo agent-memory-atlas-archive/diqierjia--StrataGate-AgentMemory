@@ -63,6 +63,8 @@ If DeepSeek Harness is already installed, add StrataGate to the profile you use:
 dsh plugin --profile web add stratagate-dsh
 ```
 
+DSH compatibility includes the complete `0.2.0` version family: all Alpha, Beta, RC, and stable releases (`>=0.2.0-0 <0.2.1-0`), alongside the previously supported hosts. A new `0.2.0` prerelease does not require a plugin update just to declare its version.
+
 Restart that profile, then keep using DSH normally. StrataGate will capture completed main-agent turns, build searchable memory in the background, and expose its Memory UI under **DSH Settings → StrataGate-AgentMemory**.
 
 By default, the database is stored at:

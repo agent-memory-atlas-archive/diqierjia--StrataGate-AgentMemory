@@ -187,11 +187,15 @@ config:
 
 ## 兼容性与权限
 
-发布门禁会在 Node `24`、Linux 和 Windows 上测试完整的 DSH `0.1.2-rc.1` 依赖族，以及 `@deepseek-ai/dsh@0.1.5-rc.1`、`@deepseek-ai/dsh@0.1.6-alpha.1`、`@deepseek-ai/dsh@0.1.7-rc.1` 和 `@deepseek-ai/dsh@0.1.7-rc.2`。0.1.5 CLI 的真实依赖树会把内部 DSH 包解析为 `0.1.5-rc.2`；0.1.6 和 0.1.7 CLI 的受测内部 DSH 与 Session Format 包分别解析为对应版本。0.1.7 宿主还提供 Cordis `4.0.4` 和 Schemastery `3.18.4`。插件将 DSH `0.1.7` 内部包的可选 peer 范围放宽到 `>=0.1.7-rc.1 <0.1.8-0`，启动时仍要求它们全部来自同一版本，并限制 Cordis 与 Schemastery 在已知的小版本补丁范围内。未来 `0.1.7` 更新可直接安装，但发布门禁只覆盖上面列出的版本；更新后仍应运行兼容性检查。不包含 `0.1.8`。
+安装声明与启动检查支持整个 DSH `0.2.0` 版本族：全部 Alpha、Beta、RC 和正式版（`>=0.2.0-0 <0.2.1-0`），无需逐个列出预发布版本。此前支持的 DSH `0.1.2-rc.1`、CLI `0.1.5-rc.1`（内部包 `0.1.5-rc.2`）、`0.1.6-alpha.1`，以及从 rc.1 到正式版的 `0.1.7` 仍受支持。启动时仍要求核心 DSH 包来自同一个版本，并限制 Cordis 为 `4.0.x`（从 `4.0.4` 起）、Schemastery 为 `3.18.x`（从 `3.18.4` 起）；早期宿主保留其原有依赖族。`0.1.8`、`0.2.1` 及其预发布版本均不在支持范围内。
 
-DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于 DSH `0.1.5` 至 `0.1.7`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
+开发依赖固定为 DSH `0.2.0-rc.2`，保证检查可复现。发布门禁配置在 Node `24`、Linux 和 Windows 上验证此前列出的旧宿主，以及 `0.2.0-rc.1` 和 `0.2.0-rc.2`。`dshWorkshop.compatibility.dshVersions` 记录用于验证的具体宿主；安装兼容性由完整的 peer 版本范围声明，测试版本列表不会限制新的 `0.2.0` 更新。
 
-DSH 0.1.7 将插件配置保存在 profile 中，并通过配置表单提供实时控制。StrataGate 聊天界面中的设置在 0.1.7 使用配置表单，在之前受支持的宿主上继续使用旧设置服务。调整结构化任务的推理力度后，后续记忆模型调用会直接使用新值，无需重启插件。
+在 DSH `0.2.0` 上，由宿主提供的 `dsh-session-format`、`dsh-session-format-catalog` 和 `dsh-session-format-v0-to-v1` 也必须与核心 DSH 包版本一致。Session Format 包混装或缺失时，插件会在旧会话迁移前拒绝启动；早期宿主保留原有兼容规则。
+
+DSH 核心包现在都是由宿主提供的可选 peer。若某个 profile 曾在本地安装这些 peer，升级后、启动前运行 `dsh plugin --profile <名称> exec stratagate-dsh-repair`。该命令只会把已知 DSH 运行时包移动到 profile 内的 `.stratagate-runtime-backups` 并写入恢复收据，不会删除包或触碰会话数据。启动时 bootstrap 还会把 StrataGate 自身的 DSH 导入定向到宿主维护的共享模块回退目录，再检查实际解析出的 DSH 核心族；未知宿主会立即给出明确错误并停止，而不是让正文区域空白。对于受支持的 DSH `0.1.5`、`0.1.6`、`0.1.7` 和 `0.2.0`，含已废弃 `stratagate/memory-citations` 事件的 v0 会话会先复制成经过校验的 v1 代际，再由宿主继续其迁移链；原始 v0 日志不会被修改，并写入 `stratagate-legacy-citations-v1.json` 记录源/目标哈希和恢复说明。
+
+DSH 0.1.7 和 0.2.0 将插件配置保存在 profile 中，并通过配置表单提供实时控制。StrataGate 聊天界面中的设置在 0.1.7 和 0.2.0 使用配置表单，在之前受支持的宿主上继续使用旧设置服务。调整结构化任务的推理力度后，后续记忆模型调用会直接使用新值，无需重启插件。
 
 DSH 0.1.6 的官方 DeepSeek profile 默认可能启用 Session Log 请求元数据，因此宿主可能把原始 Session Event 放入 `dsh_session_log` 请求字段。该元数据不属于模型 messages、system prompt 或 tool schema，不能据此判断 StrataGate 压缩失效。StrataGate 不会修改这一 DSH 全局设置；需要关闭的用户应通过 DSH 配置设置 `session-log-deepseek.enabled=false`。
 

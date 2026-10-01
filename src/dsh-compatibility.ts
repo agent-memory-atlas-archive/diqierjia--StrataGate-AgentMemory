@@ -3,7 +3,7 @@ import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
 
-const RUNTIME_PACKAGES = [
+const CORE_RUNTIME_PACKAGES = [
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-agent-default-model',
   '@deepseek-ai/dsh-client-ui-conversation',
@@ -15,6 +15,14 @@ const RUNTIME_PACKAGES = [
   '@deepseek-ai/dsh-tools',
   '@deepseek-ai/schemastery',
 ] as const
+
+const SESSION_FORMAT_PACKAGES = [
+  '@deepseek-ai/dsh-session-format',
+  '@deepseek-ai/dsh-session-format-catalog',
+  '@deepseek-ai/dsh-session-format-v0-to-v1',
+] as const
+
+const RUNTIME_PACKAGES = [...CORE_RUNTIME_PACKAGES, ...SESSION_FORMAT_PACKAGES] as const
 
 const SUPPORTED_RUNTIME_FAMILIES = [
   {
@@ -103,11 +111,21 @@ export type DshRuntimePackageVersions = Readonly<Record<(typeof RUNTIME_PACKAGES
 
 export const STRATAGATE_MESSAGE_SOURCE_KIND = 'plugin:stratagate-memory' as const
 
+/** Match >=0.2.0-0 <0.2.1-0 without adding a runtime semver dependency. */
+function isDsh020Version(version: string): boolean {
+  const match = /^0\.2\.0(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(version)
+  if (!match) return false
+  const prerelease = match[1]?.split('.') ?? []
+  const build = match[2]?.split('.') ?? []
+  return [...prerelease, ...build].every((part) => part.length > 0)
+    && prerelease.every((part) => !/^\d+$/.test(part) || part === '0' || !part.startsWith('0'))
+}
+
 export function buildDshMessageSource(
   version: string,
   form?: 'instructions' | 'catalog' | 'snapshot' | 'notice' | 'relay' | 'recall',
 ): any {
-  const source = /^0\.1\.7(?:-|$)/.test(version)
+  const source = /^0\.1\.7(?:-|$)/.test(version) || isDsh020Version(version)
     ? { kind: STRATAGATE_MESSAGE_SOURCE_KIND }
     : { kind: 'plugin', plugin: 'stratagate-memory' }
   return form ? { ...source, form } : source
@@ -160,16 +178,21 @@ function isCompatiblePatch(version: string, major: number, minor: number, minimu
  */
 export function classifyDshRuntime(packageVersions: DshRuntimePackageVersions): DshRuntimeCompatibility {
   const family = SUPPORTED_RUNTIME_FAMILIES.find(({ versions }) => (
-    RUNTIME_PACKAGES.every((name) => packageVersions[name] === versions[name])
+    CORE_RUNTIME_PACKAGES.every((name) => packageVersions[name] === versions[name])
   ))
   if (family) return { cliVersion: family.cli, packageVersions }
 
   const dshVersion = packageVersions['@deepseek-ai/dsh-session']
-  const sameDshFamily = RUNTIME_PACKAGES
+  const sameDshFamily = CORE_RUNTIME_PACKAGES
     .filter((name) => name.startsWith('@deepseek-ai/dsh-'))
     .every((name) => packageVersions[name] === dshVersion)
-  if ((/^0\.1\.7-rc\.[1-9]\d*$/.test(dshVersion) || dshVersion === '0.1.7')
+  // Preserve older host rules; the complete 0.2.0 runtime also owns the codecs
+  // used by startup migration and native Session checkpoint persistence.
+  const sameSessionFormatFamily = !isDsh020Version(dshVersion)
+    || SESSION_FORMAT_PACKAGES.every((name) => packageVersions[name] === dshVersion)
+  if ((/^0\.1\.7-rc\.[1-9]\d*$/.test(dshVersion) || dshVersion === '0.1.7' || isDsh020Version(dshVersion))
     && sameDshFamily
+    && sameSessionFormatFamily
     && isCompatiblePatch(packageVersions['@deepseek-ai/cordis'], 4, 0, 4)
     && isCompatiblePatch(packageVersions['@deepseek-ai/schemastery'], 3, 18, 4)) {
     return { cliVersion: dshVersion, packageVersions }
@@ -182,7 +205,8 @@ export function classifyDshRuntime(packageVersions: DshRuntimePackageVersions): 
     + '(internal DSH packages 0.1.2-rc.1) and @deepseek-ai/dsh@0.1.5-rc.1 '
     + '(its real dependency tree uses internal DSH packages 0.1.5-rc.2), and '
     + '@deepseek-ai/dsh@0.1.6-alpha.1 (internal DSH packages 0.1.6-alpha.1), and '
-    + 'the coherent DSH 0.1.7 family from rc.1 through the 0.1.7 release '
+    + 'the coherent DSH 0.1.7 family from rc.1 through the 0.1.7 release, and '
+    + 'the complete DSH 0.2.0 family (all alpha, beta, rc, and stable versions; >=0.2.0-0 <0.2.1-0) '
     + '(Cordis 4.0.x from 4.0.4, Schemastery 3.18.x from 3.18.4). '
     + 'Reinstall or update stratagate-dsh through `dsh plugin --profile <name> add <package>` so the host supplies its peers.',
   )
