@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.95 - Unreleased
+
+- Clarify the DSH `memory_search_events` tool description: search historical facts, decisions, plans, changes, preferences, outcomes, and timing with focused, distinctive queries; treat compact results as candidates and expand Events when needed to verify details.
+- State explicitly that `rankScore` indicates retrieval order, not confidence or factual accuracy. Preserve the parameter structure, other tool descriptions, memory protocol, retrieval behavior, and WorkBuddy.
+- Verify the approved tool and query descriptions and complete parameter JSON Schema through the final DSH tool registry.
+
 ## 0.2.94 - Unreleased
 
 - Simplify the DSH main-agent memory protocol by removing tool-level batch, citation, and memory-merge details while retaining the six Block layers, evidence-gated use, adopted-evidence reinforcement, and Profile consent boundaries.

@@ -165,6 +165,19 @@ describe('DSH plugin composition', () => {
       for (const tool of tools) {
         expect(tool.description, tool.name).toMatch(/^This tool is provided by the StrataGate plugin\./)
       }
+      const eventSearch = tools.find(({ name }) => name === 'memory_search_events')
+      expect(eventSearch?.description).toBe('This tool is provided by the StrataGate plugin. Search durable Event memories for past facts, decisions, plans, changes, preferences, outcomes, and timing. Use a focused query with the most distinctive known names, entities, versions, tools, decisions, or outcomes. Results are compact candidates; rankScore reflects retrieval order only, not confidence or factual accuracy. Expand a relevant Event when its compact fields are not enough to verify the needed detail.')
+      expect(eventSearch?.parameters).toEqual({
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'A focused query for the target historical memory. Prefer explicit names, entities, versions, tools, decisions, or outcomes over vague references.' },
+          limit: { type: 'integer', description: 'Maximum results, 1-20.' },
+          temporalIntent: { type: 'string', enum: ['first', 'latest'] },
+          eventType: { type: 'string' },
+          participants: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['query'],
+      })
       const prompt = await ctx.systemPrompt.assemble()
       const memorySections = prompt.sections.filter(({ name }) => name === 'tool:stratagate-memory')
       expect(memorySections).toHaveLength(1)
