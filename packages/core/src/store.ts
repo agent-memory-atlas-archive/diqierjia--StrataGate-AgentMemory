@@ -90,6 +90,7 @@ import type {
 } from './types.js';
 import { criticalityFloor, memoryWeightAt } from './weights.js';
 import { toUtc8Iso } from './time.js';
+import { MemoryTopicDirectory, type MemoryTopic, type TopicProjectionContext, type TopicProjectionJob, type TopicProjectionResult } from './topics.js';
 
 export interface StrataGateOptions {
   blockTurnSize?: number;
@@ -319,6 +320,7 @@ export class StrataGate {
   private readonly summaryJobs = new Map<string, BlockSummaryJob>();
   private readonly elementProjectionJobs = new Map<string, ElementProjectionJob>();
   private readonly graphProjectionJobs = new Map<string, GraphProjectionJob>();
+  private readonly topicDirectory = new MemoryTopicDirectory();
   private readonly manualRetryRuns = new Map<string, Promise<unknown>>();
   private readonly usageReceipts = new Map<string, UsageReceipt>();
   private readonly successfulModelResponses: SuccessfulModelResponse[] = [];
@@ -703,6 +705,52 @@ export class StrataGate {
     return [...this.graphProjectionJobs.values()];
   }
 
+  /** Navigation only; this never updates retrieval or adoption weights. */
+  listMemoryTopics(allowedEventIds?: readonly string[]): MemoryTopic[] {
+    const allowed = allowedEventIds === undefined ? null : new Set(allowedEventIds);
+    return this.topicDirectory.list(this.listAllEvents().filter((event) => allowed === null || allowed.has(event.id)));
+  }
+
+  getMemoryTopic(id: string): MemoryTopic | null {
+    return this.listMemoryTopics().find((topic) => topic.id === id) ?? null;
+  }
+
+  listTopicProjectionJobs(): readonly TopicProjectionJob[] {
+    return this.topicDirectory.jobs();
+  }
+
+  hasPendingTopicWork(): boolean {
+    return this.topicDirectory.hasPending(this.listAllEvents(), this.now().getTime());
+  }
+
+  async claimNextTopicProjection(): Promise<TopicProjectionContext | null> {
+    return this.commitMutation(() => this.topicDirectory.claim(this.listAllEvents(), toUtc8Iso(this.now())));
+  }
+
+  async completeTopicProjection(jobId: string, result: TopicProjectionResult): Promise<{ topicIds: string[] }> {
+    return this.commitMutation(() => this.topicDirectory.complete(jobId, result, this.listAllEvents(), toUtc8Iso(this.now())));
+  }
+
+  async failTopicProjection(jobId: string, error: unknown): Promise<void> {
+    await this.commitMutation(() => this.topicDirectory.fail(jobId, error, toUtc8Iso(this.now())));
+  }
+
+  /** Reload durable changes from another worker without creating a write or receipt. */
+  async refreshFromStorage(): Promise<void> {
+    if (!this.storage || !this.namespace) return;
+    const previous = this.mutationQueue;
+    let release!: () => void;
+    this.mutationQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const loaded = await this.storage.load(this.namespace);
+      if (loaded && loaded.revision !== this.revision) {
+        this.restoreSnapshot(loaded.snapshot);
+        this.revision = loaded.revision;
+      }
+    } finally { release(); }
+  }
+
   listUsageReceipts(): readonly UsageReceipt[] {
     return [...this.usageReceipts.values()];
   }
@@ -749,6 +797,7 @@ export class StrataGate {
       ingestionReceipts: [...this.ingestionReceipts.values()],
       externalMemoryImportJobs: [...this.externalMemoryImportJobs.values()],
       successfulModelResponses: this.successfulModelResponses,
+      memoryTopicState: this.topicDirectory.snapshot(this.listAllEvents()),
     });
   }
 
@@ -1317,7 +1366,11 @@ export class StrataGate {
 
   async searchEvents(query: string, options: SearchOptions = {}): Promise<EventSearchResult[]> {
     const limit = Math.max(1, Math.min(20, options.limit ?? 6));
+    const offset = options.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new TypeError('Event search offset must be a non-negative safe integer');
+    const laneLimit = offset + limit;
     const agentWeight = Math.max(0, options.agentMemoryWeight ?? 1);
+    const scopedIds = options.eventIds === undefined ? null : new Set(options.eventIds);
     // Per-pool top-k: each pool produces its own ranking over its own lane so
     // a large pool cannot crowd the other one out of the result window, then
     // the two rankings fuse through weighted RRF (the agent pool's share is
@@ -1325,8 +1378,9 @@ export class StrataGate {
     const rankings: EventCard[][] = [];
     const weights: number[] = [];
     const passive = this.rankEventPool(
-      this.events.filter((event) => event.status === 'active' || event.status === 'superseded'),
-      query, options, limit,
+      this.events.filter((event) => (event.status === 'active' || event.status === 'superseded')
+        && (scopedIds === null || scopedIds.has(event.id))),
+      query, options, laneLimit,
     );
     if (passive.length > 0) {
       rankings.push(passive);
@@ -1334,8 +1388,9 @@ export class StrataGate {
     }
     if (agentWeight > 0) {
       const agent = this.rankEventPool(
-        this.agentEvents.filter((event) => event.status === 'active' || event.status === 'superseded'),
-        query, options, limit,
+        this.agentEvents.filter((event) => (event.status === 'active' || event.status === 'superseded')
+          && (scopedIds === null || scopedIds.has(event.id))),
+        query, options, laneLimit,
       );
       if (agent.length > 0) {
         rankings.push(agent);
@@ -1343,7 +1398,7 @@ export class StrataGate {
       }
     }
     if (rankings.length === 0) return [];
-    const ranked = rrfRank(rankings, weights).slice(0, limit).map(({ item: event, score }) => ({ event, score }));
+    const ranked = rrfRank(rankings, weights).slice(offset, offset + limit).map(({ item: event, score }) => ({ event, score }));
     if (ranked.length > 0 && options.trackRetrieval !== false) {
       const now = toUtc8Iso(this.now());
       await this.commitMutation(() => {
@@ -2955,7 +3010,9 @@ export class StrataGate {
     await previous;
     if (!this.storage) {
       try {
-        return await mutation();
+        const result = await mutation();
+        this.topicDirectory.synchronize(this.listAllEvents(), toUtc8Iso(this.now()));
+        return result;
       } finally {
         release();
       }
@@ -2967,6 +3024,7 @@ export class StrataGate {
     const beforeRawDeletes = new Set(this.pendingRawDeletes);
     try {
       const result = await mutation();
+      this.topicDirectory.synchronize(this.listAllEvents(), toUtc8Iso(this.now()));
       await this.persist();
       return result;
     } catch (error) {
@@ -3026,6 +3084,8 @@ export class StrataGate {
     this.externalMemoryImportJobs.clear();
     for (const job of copy.externalMemoryImportJobs) this.externalMemoryImportJobs.set(job.id, job);
     this.successfulModelResponses.splice(0, this.successfulModelResponses.length, ...(copy.successfulModelResponses ?? []));
+    this.topicDirectory.restore(copy.memoryTopicState);
+    this.topicDirectory.synchronize(this.listAllEvents(), toUtc8Iso(this.now()));
     this.validateReferences();
   }
 
