@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.94 - Unreleased
+
+- Simplify the DSH main-agent memory protocol by removing tool-level batch, citation, and memory-merge details while retaining the six Block layers, evidence-gated use, adopted-evidence reinforcement, and Profile consent boundaries.
+- Clarify when to search history outside the visible conversation, Event/Graph responsibilities, automatic memory versus explicit retrieval, evidence sufficiency, and targeted follow-up retrieval without repeating failed searches.
+- Verify the complete approved protocol in assembled system prompts, including session-scoped and activated-memory contexts. Tool descriptions, runtime behavior, and WorkBuddy remain unchanged.
+
 ## 0.2.93 - Unreleased
 
 - Support the complete DeepSeek Harness `0.2.0` version family: all Alpha, Beta, RC, and stable releases (`>=0.2.0-0 <0.2.1-0`), without listing individual prereleases as installation requirements. Preserve the previously supported DSH versions.
