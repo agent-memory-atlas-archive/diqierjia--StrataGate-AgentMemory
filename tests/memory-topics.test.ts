@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
 import type { DshModelBridge } from '../src/llm.js'
 import { StrataGateRuntime } from '../src/runtime.js'
+import { DshMetadataStore, TOPIC_BOOTSTRAP_WINDOW_MS, TOPIC_BOOTSTRAP_WINDOW_CALLS } from '../src/metadata.js'
 
 interface SeedEvent {
   id: string
@@ -571,6 +572,196 @@ describe('memory topic runtime boundaries', () => {
     } finally {
       complete.mockRestore()
       await runtime.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('persists a database-wide backfill budget across restarts, prioritizes new Events and resumes in later windows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-topic-budget-'))
+    const database = join(directory, 'memory.db')
+    const namespace = 'dsh:project:large-history'
+    let now = Date.now()
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    const topicProjector = vi.fn(async (context: TopicProjectionContext): Promise<TopicProjectionResult> => ({
+      topics: [{ ...(context.existingTopics[0] ? { topicId: context.existingTopics[0].id } : {}),
+        title: '部署历史', description: '按来源查看部署经过', sourceEventIds: context.events.map(({ id }) => id), overview: [] }],
+    }))
+    const createRuntime = () => new StrataGateRuntime(makeConfig(database), {
+      ...makeModels().models, isReady: () => true, topicProjector,
+    } as unknown as DshModelBridge)
+    let runtime = createRuntime()
+    let worker = manualWorker(runtime)
+    try {
+      const history = Array.from({ length: 61 }, (_, index) => ({
+        id: `history-${index}`, title: `部署记录 ${index}`, summary: `历史部署 ${index}`, topic: '部署历史',
+      }))
+      await seed(database, namespace, history, false)
+      for (let round = 0; round < 6; round += 1) await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(TOPIC_BOOTSTRAP_WINDOW_CALLS)
+      const first = (await runtime.adminSnapshot(namespace))!
+      const topicId = first.memoryTopicState!.topics[0]!.id
+      expect(Object.keys(first.memoryTopicState!.projectedVersions)).toHaveLength(24)
+      expect(first.memoryTopicState!.bootstrap?.status).toBe('running')
+      const paidIds = new Set(topicProjector.mock.calls.flatMap(([context]) => context.events.map(({ id }) => id)))
+      await runtime.close()
+      runtime = createRuntime(); worker = manualWorker(runtime)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(2)
+      expect((await runtime.adminSnapshot(namespace))!.memoryTopicState!.topics[0]!.id).toBe(topicId)
+      await seed(database, namespace, [{ id: 'new-incremental', title: '新的部署决定', summary: '新增资料', topic: '部署历史' }], false)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(3)
+      expect(topicProjector.mock.calls[2]![0].events.map(({ id }) => id)).toEqual(['new-incremental'])
+      await seed(database, 'dsh:project:other-history', history.slice(0, 3), false)
+      await worker.runBackgroundNamespace('dsh:project:other-history')
+      expect(topicProjector).toHaveBeenCalledTimes(3) // Other namespaces share the same allowance.
+      const frozen = (await runtime.adminSnapshot(namespace))!.memoryTopicState!.bootstrap!
+      expect(Object.keys(frozen.sourceVersions)).toHaveLength(61)
+      expect(frozen.sourceVersions['new-incremental']).toBeUndefined()
+      for (let window = 0; window < 2; window += 1) {
+        now += TOPIC_BOOTSTRAP_WINDOW_MS
+        for (let round = 0; round < 4; round += 1) await worker.runBackgroundNamespace(namespace)
+      }
+      expect(topicProjector).toHaveBeenCalledTimes(7) // Six historical batches + one incremental batch.
+      const allIds = topicProjector.mock.calls.flatMap(([context]) => context.events.map(({ id }) => id))
+      expect(allIds).toHaveLength(62)
+      expect(new Set(allIds).size).toBe(62)
+      expect(topicProjector.mock.calls.slice(3).some(([context]) => context.events.some(({ id }) => paidIds.has(id)))).toBe(false)
+      expect(topicProjector.mock.calls.every(([context]) => context.events.length <= 12)).toBe(true)
+      const finished = (await runtime.adminSnapshot(namespace))!
+      expect(finished.memoryTopicState!.bootstrap).toMatchObject({ status: 'completed', failedEvents: 0 })
+      expect(finished.memoryTopicState!.topics[0]!.id).toBe(topicId)
+      expect(new Set(finished.memoryTopicState!.topics.flatMap((topic) => topic.sourceEventIds)).size).toBe(62)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(7)
+    } finally {
+      clock.mockRestore()
+      await runtime.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  }, 15_000)
+
+  it('keeps an incremental claim returned after a competing writer initializes Bootstrap during a refresh race', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-topic-initialize-race-'))
+    const database = join(directory, 'memory.db')
+    const namespace = 'dsh:project:initialize-race'
+    const topicProjector = vi.fn(async (context: TopicProjectionContext): Promise<TopicProjectionResult> => ({
+      topics: [{ topicId: context.existingTopics[0]!.id, title: '部署记录', description: '查看来源核实',
+        sourceEventIds: context.events.map(({ id }) => id), overview: [] }],
+    }))
+    const runtime = new StrataGateRuntime(makeConfig(database), {
+      ...makeModels().models, isReady: () => true, topicProjector,
+    } as unknown as DshModelBridge)
+    const worker = manualWorker(runtime)
+    await seed(database, namespace, [deploymentEvents[0]!], false)
+    const originalClaim = StrataGate.prototype.claimNextTopicProjection
+    let oldId: string | undefined
+    const claim = vi.spyOn(StrataGate.prototype, 'claimNextTopicProjection')
+      .mockImplementationOnce(async function (this: StrataGate, mode) {
+        const other = await StrataGate.open({ database, namespace })
+        try {
+          const batch = (await originalClaim.call(other))!
+          oldId = (await other.completeTopicProjection(batch.jobId, { topics: [{
+            title: '部署记录', description: '查看来源核实', sourceEventIds: batch.events.map(({ id }) => id), overview: [],
+          }] })).topicIds[0]
+          const block = other.listBlocks()[0]!
+          await other.addEvent({ id: 'incremental-race', title: '新的部署记录', summary: '新的决定',
+            sourceBlockId: block.id, sourceMessageIds: [block.l5Raw[0]!.id] })
+        } finally { await other.close() }
+        // Real durable revision conflict: runtime must refresh and retain the
+        // returned incremental job instead of dropping it as initialization.
+        return originalClaim.call(this, mode)
+      })
+    try {
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(1)
+      expect(topicProjector.mock.calls[0]![0].events.map(({ id }) => id)).toEqual(['incremental-race'])
+      const state = (await runtime.adminSnapshot(namespace))!.memoryTopicState!
+      expect(state.jobs.every((job) => job.status === 'completed')).toBe(true)
+      expect(state.topics[0]!.id).toBe(oldId)
+      expect(new Set(state.topics[0]!.sourceEventIds)).toEqual(new Set(['event-pnpm', 'incremental-race']))
+    } finally {
+      claim.mockRestore()
+      await runtime.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('atomically reserves historical slots across connections and does not reset the budget when reopened', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-topic-reservation-'))
+    const database = join(directory, 'memory.db')
+    const first = new DshMetadataStore(database)
+    const second = new DshMetadataStore(database)
+    const now = Date.now()
+    try {
+      expect(first.reserveTopicBootstrapCall(now)).toBe(true)
+      expect(second.reserveTopicBootstrapCall(now)).toBe(true)
+      expect(first.reserveTopicBootstrapCall(now)).toBe(false)
+      first.close()
+      const reopened = new DshMetadataStore(database)
+      try {
+        expect(reopened.reserveTopicBootstrapCall(now)).toBe(false)
+        expect(reopened.reserveTopicBootstrapCall(now + TOPIC_BOOTSTRAP_WINDOW_MS)).toBe(true)
+      } finally { reopened.close() }
+    } finally {
+      // first was already closed after persisting its reservation.
+      second.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('charges retries to the same backfill budget and permanently settles exhausted inputs with fallback', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-topic-budget-retry-'))
+    const database = join(directory, 'memory.db')
+    const namespace = 'dsh:project:history-retry'
+    vi.useFakeTimers({ toFake: ['Date'] })
+    let now = Date.now()
+    vi.setSystemTime(now)
+    const topicProjector = vi.fn(async (context: TopicProjectionContext): Promise<TopicProjectionResult> => {
+      if (topicProjector.mock.calls.length <= 3) throw new Error('模型暂时失败，含海棠敏感响应')
+      return { topics: [{ title: '其余部署记录', description: '查看来源核实',
+        sourceEventIds: context.events.map(({ id }) => id), overview: [] }] }
+    })
+    const runtime = new StrataGateRuntime(makeConfig(database), {
+      ...makeModels().models, isReady: () => true, topicProjector,
+    } as unknown as DshModelBridge)
+    const worker = manualWorker(runtime)
+    try {
+      await seed(database, namespace, Array.from({ length: 14 }, (_, index) => ({
+        id: `retry-history-${index}`, title: '部署历史', summary: '历史来源', topic: '部署历史',
+      })), false)
+      await worker.runBackgroundNamespace(namespace)
+      now += 30_000; vi.setSystemTime(now)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(2)
+      now += 60_000; vi.setSystemTime(now)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(2) // Retry due, but this window is exhausted.
+      now += TOPIC_BOOTSTRAP_WINDOW_MS; vi.setSystemTime(now)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(3)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(4)
+      const failedIds = topicProjector.mock.calls[0]![0].events.map(({ id }) => id)
+      expect(topicProjector.mock.calls[1]![0].events.map(({ id }) => id)).toEqual(failedIds)
+      expect(topicProjector.mock.calls[2]![0].events.map(({ id }) => id)).toEqual(failedIds)
+      const state = (await runtime.adminSnapshot(namespace))!.memoryTopicState!
+      expect(state.bootstrap).toMatchObject({ status: 'completed', failedEvents: 12 })
+      expect(state.jobs.find((job) => !job.superseded && job.status === 'failed'))
+        .toMatchObject({ attempts: 3, nextRetryAt: null, lastError: 'worker-failed', context: null })
+      expect(JSON.stringify(state)).not.toContain('海棠')
+      now += TOPIC_BOOTSTRAP_WINDOW_MS; vi.setSystemTime(now)
+      await worker.runBackgroundNamespace(namespace)
+      expect(topicProjector).toHaveBeenCalledTimes(4)
+      const reader = await StrataGate.open({ database, namespace })
+      try {
+        expect(reader.hasPendingTopicWork()).toBe(false)
+        expect(await reader.claimNextTopicProjection()).toBeNull()
+        expect(new Set(reader.listMemoryTopics().flatMap((topic) => topic.sourceEventIds)).size).toBe(14)
+      } finally { await reader.close() }
+    } finally {
+      await runtime.close()
+      vi.useRealTimers()
       await rm(directory, { recursive: true, force: true })
     }
   })

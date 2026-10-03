@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { StrataGate, TOPIC_LEASE_MS, normalizeSnapshot, type TopicProjectionContext, type TopicProjectionResult } from '../src/index.js';
+import { StrataGate, MemoryTopicDirectory, MEMORY_TOPIC_PROJECTOR_VERSION, TOPIC_LEASE_MS, normalizeSnapshot, type TopicProjectionContext, type TopicProjectionResult } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite.js';
 
 const summarizer = async () => ({ l0Title: '对话', l0Tags: [], l1Summary: '对话', l2Keypoints: [], shouldExtract: false });
@@ -74,7 +74,11 @@ describe('rebuildable Event-backed topic directory', () => {
     await memory.searchEvents('部署项目');
     await memory.recordMemoryUse({ eventIds: [event!.id], elementIds: [] });
     await memory.pinEvent(event!.id);
+    event!.weight.floorWeight *= 0.5;
+    event!.updatedAt = '2026-10-03T00:00:00Z';
     expect(memory.hasPendingTopicWork()).toBe(false);
+    expect(memory.getTopicBootstrapState()?.status).toBe('completed');
+    expect(await memory.claimNextTopicProjection()).toBeNull();
     expect(memory.getMemoryTopic(topicIds[0]!)?.isFallback).toBeUndefined();
     event!.temporal.status = 'cancelled';
     expect(memory.hasPendingTopicWork()).toBe(true);
@@ -123,6 +127,105 @@ describe('rebuildable Event-backed topic directory', () => {
     await memory.failTopicProjection(pending.jobId, new Error('late failure'));
     expect(memory.listTopicProjectionJobs().find((job) => job.id === pending.jobId)?.nextRetryAt).toBeNull();
     expect(memory.hasPendingTopicWork()).toBe(true);
+  });
+
+  it('keeps the old id across multiple rebuild batches when the model omits topicId, then stops permanently', async () => {
+    const memory = StrataGate.inMemory(options);
+    const events = await seed(memory, 29);
+    let id: string | undefined;
+    while (memory.hasPendingTopicWork()) {
+      const batch = (await memory.claimNextTopicProjection())!;
+      id = (await memory.completeTopicProjection(batch.jobId, projection(batch, id))).topicIds[0];
+    }
+    await memory.forgetEvent(events[0]!.id);
+    let calls = 0;
+    while (memory.hasPendingTopicWork() && calls < 5) {
+      const batch = (await memory.claimNextTopicProjection())!;
+      expect(projection(batch).topics[0]!.topicId).toBeUndefined();
+      expect((await memory.completeTopicProjection(batch.jobId, projection(batch))).topicIds).toEqual([id]);
+      calls += 1;
+    }
+    expect(calls).toBe(3);
+    expect(memory.exportSnapshot().memoryTopicState!.topics).toHaveLength(1);
+    expect(memory.getMemoryTopic(id!)?.sourceEventIds).toHaveLength(28);
+    expect(memory.hasPendingTopicWork()).toBe(false);
+    expect(await memory.claimNextTopicProjection()).toBeNull();
+    expect((await memory.searchEvents('', { eventIds: memory.getMemoryTopic(id!)!.sourceEventIds,
+      limit: 50, trackRetrieval: false })).map(({ event }) => event.id)).not.toContain(events[0]!.id);
+  });
+
+  it('retires an invalidated predecessor when omitted ids cannot be matched unambiguously', async () => {
+    const memory = StrataGate.inMemory(options);
+    const events = await seed(memory, 4);
+    const initial = (await memory.claimNextTopicProjection())!;
+    const oldId = (await memory.completeTopicProjection(initial.jobId, projection(initial))).topicIds[0]!;
+    await memory.forgetEvent(events[0]!.id);
+    const batch = (await memory.claimNextTopicProjection())!;
+    const result: TopicProjectionResult = { topics: batch.events.map((event) => ({
+      title: event.title, description: '可验证的来源入口', sourceEventIds: [event.id], overview: [],
+    })) };
+    await memory.completeTopicProjection(batch.jobId, result);
+    expect(memory.getMemoryTopic(oldId)).toBeNull();
+    expect(memory.exportSnapshot().memoryTopicState!.topics.every((topic) => !topic.invalidated)).toBe(true);
+    expect(new Set(memory.listMemoryTopics().flatMap((topic) => topic.sourceEventIds)))
+      .toEqual(new Set(events.slice(1).map(({ id }) => id)));
+    expect(memory.hasPendingTopicWork()).toBe(false);
+    expect(await memory.claimNextTopicProjection()).toBeNull();
+  });
+
+  it('rejects a rebuild after another connection forgets a source, then rebuilds only the survivor', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-topic-rebuild-stale-'));
+    const database = join(directory, 'memory.sqlite');
+    const open = () => StrataGate.open({ ...options, database, namespace: 'project' });
+    let writer: StrataGate | undefined;
+    let other: StrataGate | undefined;
+    try {
+      writer = await open();
+      const events = await seed(writer, 3);
+      const initial = (await writer.claimNextTopicProjection())!;
+      const result = projection(initial);
+      result.topics[0]!.title = '海棠旧标题';
+      result.topics[0]!.overview[0]!.text = '海棠旧概要';
+      const oldId = (await writer.completeTopicProjection(initial.jobId, result)).topicIds[0]!;
+      await writer.forgetEvent(events[0]!.id);
+      const inFlight = (await writer.claimNextTopicProjection())!;
+      other = await open();
+      await other.forgetEvent(events[1]!.id);
+      await writer.refreshFromStorage();
+      await expect(writer.completeTopicProjection(inFlight.jobId, projection(inFlight, oldId))).rejects.toThrow(/not running|stale/);
+      expect(JSON.stringify(writer.listMemoryTopics())).not.toContain('海棠');
+      expect(JSON.stringify(writer.listTopicProjectionJobs())).not.toContain('海棠');
+      expect(JSON.stringify(writer.exportSnapshot().memoryTopicState)).not.toContain('海棠');
+      const surviving = (await writer.claimNextTopicProjection())!;
+      expect(surviving.events.map(({ id }) => id)).toEqual([events[2]!.id]);
+      expect(JSON.stringify(surviving.existingTopics)).not.toContain('海棠');
+      expect((await writer.completeTopicProjection(surviving.jobId, projection(surviving))).topicIds).toEqual([oldId]);
+      expect(writer.hasPendingTopicWork()).toBe(false);
+    } finally {
+      await writer?.close(); await other?.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('starts a new frozen generation only when the projector version changes', async () => {
+    const memory = StrataGate.inMemory(options);
+    const events = await seed(memory, 2);
+    const batch = (await memory.claimNextTopicProjection())!;
+    const oldId = (await memory.completeTopicProjection(batch.jobId, projection(batch))).topicIds[0]!;
+    const oldState = memory.exportSnapshot().memoryTopicState!;
+    oldState.bootstrap!.projectorVersion = MEMORY_TOPIC_PROJECTOR_VERSION - 1;
+    oldState.topics[0]!.projectorVersion = MEMORY_TOPIC_PROJECTOR_VERSION - 1;
+    const directory = new MemoryTopicDirectory();
+    directory.restore(oldState);
+    const now = new Date().toISOString();
+    expect(directory.hasPending(events, Date.parse(now))).toBe(true);
+    expect(directory.claim(events, now, 'incremental')).toBeNull();
+    expect(directory.bootstrap()?.status).toBe('pending');
+    const rebuild = directory.claim(events, now, 'bootstrap')!;
+    expect(directory.complete(rebuild.jobId, projection(rebuild), events, now).topicIds).toEqual([oldId]);
+    directory.synchronize(events, now);
+    expect(directory.bootstrap()).toMatchObject({ status: 'completed', projectorVersion: MEMORY_TOPIC_PROJECTOR_VERSION });
+    expect(directory.hasPending(events, Date.parse(now))).toBe(false);
   });
 
   it('validates evidence, complete batch coverage, reused ids and overview kinds atomically', async () => {
@@ -403,24 +506,49 @@ describe('rebuildable Event-backed topic directory', () => {
     let reader: SqliteStorage | undefined;
     try {
       memory = await StrataGate.open({ ...options, database, namespace: 'old' });
-      const [event] = await seed(memory);
+      const events = await seed(memory, 29);
+      const original = memory.exportSnapshot();
       await memory.close(); memory = undefined;
       const old = new DatabaseSync(database);
       old.exec('DROP TABLE memory_topic_state'); old.close();
       reader = new SqliteStorage({ filename: database, readonly: true });
       const loaded = (await reader.load('old'))!;
       expect(loaded.snapshot.memoryTopicState).toBeUndefined();
-      expect(loaded.snapshot.events.map(({ id }) => id)).toEqual([event!.id]);
+      expect(loaded.snapshot.events.map(({ id }) => id)).toEqual(events.map(({ id }) => id));
       expect(loaded.snapshot.blocks[0]!.l5Raw[0]!.content).toBe('项目原文');
       const verify = new DatabaseSync(database, { readOnly: true });
       expect(verify.prepare("SELECT name FROM sqlite_master WHERE name = 'memory_topic_state'").get()).toBeUndefined();
       verify.close();
       await reader.close(); reader = undefined;
       memory = await StrataGate.open({ ...options, database, namespace: 'old' });
-      expect(memory.listMemoryTopics()[0]).toMatchObject({ isFallback: true, sourceEventIds: [event!.id] });
+      expect(memory.listMemoryTopics()).toHaveLength(29);
+      expect(memory.listMemoryTopics().every((topic) => topic.isFallback)).toBe(true);
       const context = (await memory.claimNextTopicProjection())!;
-      await memory.completeTopicProjection(context.jobId, projection(context));
-      expect(memory.listMemoryTopics()[0]?.isFallback).toBeUndefined();
+      const { topicIds } = await memory.completeTopicProjection(context.jobId, projection(context));
+      expect(memory.getTopicBootstrapState()).toMatchObject({ status: 'running', completedAt: null, failedEvents: 0 });
+      await memory.close(); memory = await StrataGate.open({ ...options, database, namespace: 'old' });
+      const seen = new Set(context.events.map(({ id }) => id));
+      let batches = 1;
+      while (memory.hasPendingTopicWork() && batches < 5) {
+        const next = (await memory.claimNextTopicProjection())!;
+        expect(next.events.length).toBeLessThanOrEqual(12);
+        expect(next.events.some(({ id }) => seen.has(id))).toBe(false);
+        for (const event of next.events) seen.add(event.id);
+        expect((await memory.completeTopicProjection(next.jobId, projection(next, topicIds[0]))).topicIds).toEqual(topicIds);
+        batches += 1;
+      }
+      expect(batches).toBe(3);
+      expect(seen.size).toBe(29);
+      expect(memory.getTopicBootstrapState()).toMatchObject({ status: 'completed', failedEvents: 0 });
+      expect(memory.hasPendingTopicWork()).toBe(false);
+      expect(await memory.claimNextTopicProjection()).toBeNull();
+      expect(new Set(memory.listMemoryTopics().flatMap((topic) => topic.sourceEventIds))).toEqual(new Set(events.map(({ id }) => id)));
+      const final = memory.exportSnapshot();
+      expect(final.events).toEqual(original.events);
+      expect(final.blocks).toEqual(original.blocks);
+      expect(final.graphNodes).toEqual(original.graphNodes);
+      expect(final.graphEdges).toEqual(original.graphEdges);
+      expect(final.schemaVersion).toBe(12);
     } finally {
       await reader?.close(); await memory?.close();
       await rm(directory, { recursive: true, force: true });

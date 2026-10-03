@@ -90,7 +90,7 @@ import type {
 } from './types.js';
 import { criticalityFloor, memoryWeightAt } from './weights.js';
 import { toUtc8Iso } from './time.js';
-import { MemoryTopicDirectory, type MemoryTopic, type TopicProjectionContext, type TopicProjectionJob, type TopicProjectionResult } from './topics.js';
+import { MemoryTopicDirectory, type MemoryTopic, type TopicBootstrapState, type TopicProjectionContext, type TopicProjectionJob, type TopicProjectionMode, type TopicProjectionResult } from './topics.js';
 
 export interface StrataGateOptions {
   blockTurnSize?: number;
@@ -719,12 +719,16 @@ export class StrataGate {
     return this.topicDirectory.jobs();
   }
 
-  hasPendingTopicWork(): boolean {
-    return this.topicDirectory.hasPending(this.listAllEvents(), this.now().getTime());
+  hasPendingTopicWork(mode: TopicProjectionMode = 'all'): boolean {
+    return this.topicDirectory.hasPending(this.listAllEvents(), this.now().getTime(), mode);
   }
 
-  async claimNextTopicProjection(): Promise<TopicProjectionContext | null> {
-    return this.commitMutation(() => this.topicDirectory.claim(this.listAllEvents(), toUtc8Iso(this.now())));
+  getTopicBootstrapState(): TopicBootstrapState | null {
+    return this.topicDirectory.bootstrap();
+  }
+
+  async claimNextTopicProjection(mode: TopicProjectionMode = 'all'): Promise<TopicProjectionContext | null> {
+    return this.commitMutation(() => this.topicDirectory.claim(this.listAllEvents(), toUtc8Iso(this.now()), mode));
   }
 
   async completeTopicProjection(jobId: string, result: TopicProjectionResult): Promise<{ topicIds: string[] }> {
