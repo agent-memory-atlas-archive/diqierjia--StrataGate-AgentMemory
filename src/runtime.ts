@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { openNativePath } from '@deepseek-ai/dsh-native-command'
 import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
@@ -1759,11 +1760,16 @@ export class StrataGateRuntime {
     const remembered = this.workspaceNames.get(namespace)
     if (remembered) return remembered
     if (this.config.database === ':memory:' || !existsSync(this.config.database)) return null
-    const metadata = new DshMetadataStore(this.config.database)
+    const database = new DatabaseSync(this.config.database, { readOnly: true })
     try {
-      return metadata.workspaceName(namespace)
+      if (!database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stratagate_dsh_workspaces'").get()) {
+        return null
+      }
+      const row = database.prepare('SELECT display_name FROM stratagate_dsh_workspaces WHERE namespace = ?')
+        .get(namespace) as { display_name: string } | undefined
+      return row?.display_name ?? null
     } finally {
-      metadata.close()
+      database.close()
     }
   }
 
