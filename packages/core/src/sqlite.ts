@@ -647,19 +647,21 @@ function encodedRawSearchTokens(content: string): string {
 }
 
 export class SqliteStorage implements StorageAdapter {
+  readonly readonly: boolean;
   private readonly database: DatabaseSync;
   private rawSearchFtsAvailable = false;
   private closed = false;
 
   constructor(options: SqliteStorageOptions) {
     if (!options.filename.trim()) throw new TypeError('SQLite filename must not be empty');
+    this.readonly = options.readonly ?? false;
     this.database = new DatabaseSync(options.filename, {
-      readOnly: options.readonly ?? false,
+      readOnly: this.readonly,
       timeout: Math.max(0, Math.floor(options.timeoutMs ?? 5_000)),
     });
     try {
       this.database.exec('PRAGMA foreign_keys = ON');
-      if (!(options.readonly ?? false)) {
+      if (!this.readonly) {
         this.database.exec('PRAGMA journal_mode = WAL');
         this.migrate();
       } else {

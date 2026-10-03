@@ -219,6 +219,7 @@ describe('rebuildable Event-backed topic directory', () => {
     directory.restore(oldState);
     const now = new Date().toISOString();
     expect(directory.hasPending(events, Date.parse(now))).toBe(true);
+    directory.initializeBootstrap(events, now);
     expect(directory.claim(events, now, 'incremental')).toBeNull();
     expect(directory.bootstrap()?.status).toBe('pending');
     const rebuild = directory.claim(events, now, 'bootstrap')!;

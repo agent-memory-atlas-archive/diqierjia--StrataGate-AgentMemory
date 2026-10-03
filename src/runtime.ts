@@ -7,7 +7,6 @@ import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session
 import {
   DERIVATION_MAX_ATTEMPTS,
   GRAPH_PROVENANCE_LIMIT,
-  MEMORY_TOPIC_PROJECTOR_VERSION,
   boundEffectiveGraphNodeView,
   effectiveGraphNodeView,
   graphTimeline,
@@ -426,17 +425,9 @@ export class StrataGateRuntime {
           async () => {
             const resumed = await memory.resumePendingWork()
             if (canProjectTopics) {
-              // Freeze the historical set once, even when this window is paused.
-              // This writer-only transition makes later sources incremental.
-              const bootstrap = memory.getTopicBootstrapState()
-              // A concurrent writer can initialize while we refresh. Retain
-              // any real incremental claim returned by that transition.
-              let job = !bootstrap || bootstrap.projectorVersion !== MEMORY_TOPIC_PROJECTOR_VERSION
+              let job = memory.hasPendingTopicWork('incremental')
                 ? await this.retryTopicWrite(namespace, memory, () => memory.claimNextTopicProjection('incremental'))
                 : null
-              if (!job && memory.hasPendingTopicWork('incremental')) {
-                job = await this.retryTopicWrite(namespace, memory, () => memory.claimNextTopicProjection('incremental'))
-              }
               if (!job && memory.hasPendingTopicWork('bootstrap')) {
                 const metadata = new DshMetadataStore(this.config.database)
                 let permitted: boolean

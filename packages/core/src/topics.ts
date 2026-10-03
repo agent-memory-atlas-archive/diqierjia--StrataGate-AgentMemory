@@ -88,7 +88,7 @@ export type TopicProjectionMode = 'all' | 'incremental' | 'bootstrap';
 
 export interface TopicBootstrapState {
   projectorVersion: number;
-  /** Frozen at the first writer claim; newly added/changed sources have priority. */
+  /** Frozen at writer open; newly added/changed sources have priority. */
   sourceVersions: Record<string, string>;
   status: 'pending' | 'running' | 'completed';
   startedAt: string;
@@ -213,6 +213,15 @@ export class MemoryTopicDirectory {
     return this.state.bootstrap ? structuredClone(this.state.bootstrap) : null;
   }
 
+  initializeBootstrap(events: readonly EventCard[], now: string): void {
+    if (this.state.bootstrap?.projectorVersion === MEMORY_TOPIC_PROJECTOR_VERSION) return;
+    this.synchronize(events, now);
+    this.state.bootstrap = { projectorVersion: MEMORY_TOPIC_PROJECTOR_VERSION,
+      sourceVersions: Object.fromEntries(sourceVersions(new Map(events.filter(visible).map((event) => [event.id, event])))),
+      status: 'pending', startedAt: now, completedAt: null, failedEvents: 0 };
+    this.synchronize(events, now);
+  }
+
   synchronize(events: readonly EventCard[], now: string): void {
     const sources = new Map(events.filter(visible).map((event) => [event.id, event]));
     const versions = sourceVersions(sources);
@@ -313,14 +322,11 @@ export class MemoryTopicDirectory {
   }
 
   claim(events: readonly EventCard[], now: string, mode: TopicProjectionMode = 'all'): TopicProjectionContext | null {
+    if (this.state.bootstrap?.projectorVersion !== MEMORY_TOPIC_PROJECTOR_VERSION) {
+      throw new Error('Topic Bootstrap must be initialized at writer open before claiming work.');
+    }
     this.synchronize(events, now);
     this.recover(now);
-    if (!this.state.bootstrap || this.state.bootstrap.projectorVersion !== MEMORY_TOPIC_PROJECTOR_VERSION) {
-      this.state.bootstrap = { projectorVersion: MEMORY_TOPIC_PROJECTOR_VERSION,
-        sourceVersions: Object.fromEntries(sourceVersions(new Map(events.filter(visible).map((event) => [event.id, event])))),
-        status: 'pending', startedAt: now, completedAt: null, failedEvents: 0 };
-      this.synchronize(events, now);
-    }
     // One in-flight model call per namespace avoids two summaries overwriting each other.
     if (this.state.jobs.some((job) => job.status === 'running')) return null;
     const sources = new Map(events.filter(visible).map((event) => [event.id, event]));
@@ -413,7 +419,9 @@ export class MemoryTopicDirectory {
       ])]);
     job.dependencyVersions = Object.fromEntries(dependencyIds.map((id) => [id, versions.get(id)!]));
     job.status = 'running'; job.attempts += 1; job.lastError = null; job.nextRetryAt = null; job.updatedAt = now;
-    if (this.state.bootstrap.status === 'pending') this.state.bootstrap.status = 'running';
+    if (this.state.bootstrap.status === 'pending' && this.matchesMode(job.sourceEventIds, versions, 'bootstrap')) {
+      this.state.bootstrap.status = 'running';
+    }
     job.leaseUntil = new Date(Date.parse(now) + TOPIC_LEASE_MS).toISOString();
     return structuredClone(job.context);
   }

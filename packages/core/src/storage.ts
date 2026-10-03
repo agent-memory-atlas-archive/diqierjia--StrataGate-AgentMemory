@@ -152,6 +152,8 @@ export interface RawMessageIndexDelta {
 }
 
 export interface StorageAdapter {
+  /** Read-only adapters never initialize or recover writer-owned state. */
+  readonly readonly?: boolean;
   load(namespace: string): Promise<LoadedStrataGateState | null>;
   save(
     namespace: string,

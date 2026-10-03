@@ -25,6 +25,7 @@ import {
   STRATAGATE_STORAGE_SCHEMA_VERSION,
   KNOWLEDGE_GRAPH_PROJECTOR_VERSION,
   DERIVATION_MAX_ATTEMPTS,
+  StorageConflictError,
   cloneSnapshot,
   isSyntheticSourceThreadId,
   normalizeSnapshot,
@@ -90,7 +91,7 @@ import type {
 } from './types.js';
 import { criticalityFloor, memoryWeightAt } from './weights.js';
 import { toUtc8Iso } from './time.js';
-import { MemoryTopicDirectory, type MemoryTopic, type TopicBootstrapState, type TopicProjectionContext, type TopicProjectionJob, type TopicProjectionMode, type TopicProjectionResult } from './topics.js';
+import { MEMORY_TOPIC_PROJECTOR_VERSION, MemoryTopicDirectory, type MemoryTopic, type TopicBootstrapState, type TopicProjectionContext, type TopicProjectionJob, type TopicProjectionMode, type TopicProjectionResult } from './topics.js';
 
 export interface StrataGateOptions {
   blockTurnSize?: number;
@@ -357,7 +358,9 @@ export class StrataGate {
   }
 
   static inMemory(options: StrataGateOptions = {}): StrataGate {
-    return new StrataGate(options, STRATAGATE_CONSTRUCTOR_TOKEN);
+    const memory = new StrataGate(options, STRATAGATE_CONSTRUCTOR_TOKEN);
+    memory.topicDirectory.initializeBootstrap([], toUtc8Iso(memory.now()));
+    return memory;
   }
 
   static async open(options: SqliteStrataGateOptions): Promise<StrataGate> {
@@ -395,7 +398,7 @@ export class StrataGate {
     const loaded = await options.storage.load(namespace);
     const loadedSnapshot = loaded ? normalizeSnapshot(loaded.snapshot) : null;
     let loadedRevision = loaded?.revision ?? 0;
-    if (loaded && loadedSnapshot) {
+    if (loaded && loadedSnapshot && !options.storage.readonly) {
       let settingsChanged = false;
       if (options.blockTurnSize !== undefined) {
         const requested = Math.max(1, Math.floor(options.blockTurnSize));
@@ -436,6 +439,12 @@ export class StrataGate {
     if (loaded && loadedSnapshot) {
       memory.restoreSnapshot(loadedSnapshot);
       memory.revision = loadedRevision;
+    }
+    // Freeze historical sources before returning a writer to ingestion or
+    // running any resumed derivation. New spaces freeze an empty, completed set.
+    if (options.storage.readonly) return memory;
+    await memory.initializeTopicBootstrap();
+    if (loaded && loadedSnapshot) {
       const interruptedSummaries = [...memory.summaryJobs.values()].filter((job) => job.status === 'running');
       if (interruptedSummaries.length > 0) {
         await memory.commitMutation(() => {
@@ -498,10 +507,23 @@ export class StrataGate {
         });
       }
       if (memory.graphProjector) await memory.commitMutation(() => memory.queueMissingGraphProjections());
-    } else {
-      await memory.persist();
     }
     return memory;
+  }
+
+  private async initializeTopicBootstrap(): Promise<void> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (this.topicDirectory.bootstrap()?.projectorVersion === MEMORY_TOPIC_PROJECTOR_VERSION) return;
+      try {
+        await this.commitMutation(() => this.topicDirectory.initializeBootstrap(this.listAllEvents(), toUtc8Iso(this.now())));
+        return;
+      } catch (error) {
+        if (!(error instanceof StorageConflictError) || attempt === 2) throw error;
+        // A competing opener may have frozen the boundary already. Adopt that
+        // committed generation rather than refreezing it around later Events.
+        await this.reloadFromStorage();
+      }
+    }
   }
 
   get turn(): number {
@@ -3006,6 +3028,7 @@ export class StrataGate {
   }
 
   private async commitMutation<T>(mutation: () => T | Promise<T>): Promise<T> {
+    if (this.storage?.readonly) throw new Error('Cannot mutate read-only StrataGate storage.');
     const previous = this.mutationQueue;
     let release!: () => void;
     this.mutationQueue = new Promise<void>((resolve) => {
