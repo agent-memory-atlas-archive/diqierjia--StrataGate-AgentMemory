@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ResolvedConfig } from '../src/config.js'
 import type { DshModelBridge } from '../src/llm.js'
 import { feedbackDraftUrl, StrataGateRuntime } from '../src/runtime.js'
+import { registerMemoryTools } from '../src/tools.js'
 
 const fakeModels = {
   run: async <T>(_session: Session, operation: () => Promise<T>): Promise<T> => operation(),
@@ -55,6 +56,46 @@ function turnEvents(turn = 1): SessionEvent[] {
 }
 
 describe('DSH runtime ingestion', () => {
+  it('memory_search_events recovers historical malformed participants without losing valid Events', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'stratagate-issue-102-tool-'))
+    const database = join(directory, 'memory.db')
+    const config: ResolvedConfig = {
+      database, namespaceMode: 'project', namespacePrefix: 'dsh', globalNamespace: 'global',
+      blockTurnSize: 1, blockDecayLambda: 0.3, ingestSubagents: false, maxOutputTokens: 2048,
+    }
+    let runtime = new StrataGateRuntime(config, fakeModels)
+    try {
+      const memory = await (runtime as unknown as { space(value: Session): Promise<StrataGate> }).space(session)
+      const block = (await memory.appendTurn({ user: 'Use SQLite.', assistant: 'Recorded.', threadId: String(session.id) })).sealedBlock!
+      const add = (title: string, participants?: string[]) => memory.addEvent({
+        title, summary: 'The project selected SQLite.', sourceBlockId: block.id,
+        sourceMessageIds: [block.l5Raw[0]!.id], temporal: { ...(participants ? { participants } : {}), eventType: 'decision' },
+      })
+      const healthy = await add('Healthy SQLite decision', ['用户', '助手'])
+      const dirty = await add('Historical SQLite decision')
+      await runtime.close()
+      const db = new DatabaseSync(database)
+      try {
+        db.prepare('UPDATE events SET temporal_json = ? WHERE id = ?').run(
+          JSON.stringify({ eventType: 'decision', participants: { item: ['用户', '助手'] } }), dirty.id,
+        )
+      } finally { db.close() }
+      runtime = new StrataGateRuntime(config, fakeModels)
+      const register = vi.fn()
+      registerMemoryTools({ tools: { register } } as unknown as Parameters<typeof registerMemoryTools>[0], runtime)
+      const tool = register.mock.calls.map(([registered]) => registered).find(({ name }) => name === 'memory_search_events')!
+      const exec = { agent: { session } }
+      const batch = await tool.execute({ query: 'SQLite' }, exec) as { results: Array<{ id: string; temporal: unknown }> }
+      expect(batch.results.map(({ id }) => id)).toEqual(expect.arrayContaining([healthy.id, dirty.id]))
+      expect(batch.results.find(({ id }) => id === dirty.id)!.temporal).toEqual({ eventType: 'decision' })
+      const filtered = await tool.execute({ query: '', participants: ['用户'] }, exec) as { results: Array<{ id: string }> }
+      expect(filtered.results.map(({ id }) => id)).toEqual([healthy.id])
+    } finally {
+      await runtime.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('derives the displayed data directory from the resolved database path and opens that exact directory', async () => {
     const database = join('relative-stratagate-data', 'memory.db')
     const opened: string[] = []

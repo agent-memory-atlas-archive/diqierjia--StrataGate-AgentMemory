@@ -1,5 +1,5 @@
 import { BLOCK_DECAY_LAMBDA } from './blocks.js';
-import { normalizeStandardEventType } from './events.js';
+import { normalizeEventTemporal, normalizeStandardEventType } from './events.js';
 import type { ElementCard, EventCard, ExternalMemoryImportJob, GraphEdge, GraphNode, MemoryBlock, RawMessage } from './types.js';
 
 export const STRATAGATE_STORAGE_SCHEMA_VERSION = 12;
@@ -408,7 +408,8 @@ export function normalizeSnapshot(value: unknown): StrataGateSnapshot {
     // metadata intact while removing them from the live Event model.
     delete (event as EventCard & { narrative?: string }).narrative;
     delete (event as EventCard & { confidence?: number }).confidence;
-    event.temporal = { ...event.temporal, eventType: normalizeStandardEventType(event.temporal.eventType) };
+    const temporal = normalizeEventTemporal(event.temporal);
+    event.temporal = { ...temporal, eventType: normalizeStandardEventType(temporal.eventType) };
     if (event.formedTurn === undefined) {
       const sourceBlock = event.sourceBlockId !== undefined ? sourceBlockMap.get(event.sourceBlockId) : undefined;
       const reliableSource = sourceBlock && !isSyntheticSourceThreadId(sourceBlock.threadId)

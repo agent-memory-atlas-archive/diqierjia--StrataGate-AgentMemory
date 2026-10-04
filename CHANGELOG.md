@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.96 - Unreleased
+
+- 修复 #102：模型输出或历史数据中的异常 EventTemporal 字段不再导致记忆检索及后续长期记忆提取失败。
+- 在事件解析、写入、SQLite 读取、快照恢复及检索边界统一校验字段形状，丢弃无法安全解释的字段，保留事件与来源；合法字段值和顺序保持不变。
+- 本次为 0.2.x bug 修复候选，不包含已撤回的主题聚合、主题目录和主题检索机制。
+
 ## 0.2.95 - Unreleased
 
 - Clarify the DSH `memory_search_events` tool description: search historical facts, decisions, plans, changes, preferences, outcomes, and timing with focused, distinctive queries; treat compact results as candidates and expand Events when needed to verify details.

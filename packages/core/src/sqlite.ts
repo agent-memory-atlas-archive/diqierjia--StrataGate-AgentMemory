@@ -25,7 +25,6 @@ import type {
   ElementFactMode,
   ElementFactStatus,
   EventCard,
-  EventTemporal,
   ExternalMemoryImportJob,
   GraphEdge,
   GraphNode,
@@ -38,7 +37,7 @@ import type {
   ToolTrace,
 } from './types.js';
 import { nowUtc8 } from './time.js';
-import { normalizeStandardEventType } from './events.js';
+import { normalizeEventTemporal, normalizeStandardEventType } from './events.js';
 import { emptyProfile, isProfileField, PROFILE_FIELDS, PROFILE_PROTECTED_SHORT_FIELDS, profileMaintenanceDue, validateProfile,
   type PersistentProfile, type ProfileChange, type ProfileChangeSource, type ProfileField } from './profile.js';
 import { searchTokens } from './search.js';
@@ -604,7 +603,7 @@ function mapEventRows(rows: EventRow[], sourcesByEvent: Map<string, string[]>, t
     ...(row.source_block_id === null ? {} : { sourceBlockId: row.source_block_id }),
     ...(row.formed_turn === null ? {} : { formedTurn: row.formed_turn }),
     temporal: (() => {
-      const temporal = parseJson<EventTemporal>(row.temporal_json, `${table}.temporal_json`);
+      const temporal = normalizeEventTemporal(parseJson<unknown>(row.temporal_json, `${table}.temporal_json`));
       return { ...temporal, eventType: normalizeStandardEventType(temporal.eventType) };
     })(),
     scope: row.scope,
