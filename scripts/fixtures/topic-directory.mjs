@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
 import { tmpdir } from 'node:os'
@@ -12,7 +13,9 @@ export const topicBrowserFixtures = {
   running: 'browser:topic-directory:running',
   failed: 'browser:topic-directory:failed',
   empty: 'browser:topic-directory:empty',
+  ordered: 'browser:topic-directory:ordered',
   topicIds: ['topic_browser_a', 'topic_browser_b'],
+  laterTopicTitle: '后来加入的主题',
   raw: '浏览器验收原始消息：Event 是历史事实的权威来源，Graph 表达当前状态。',
 }
 
@@ -32,6 +35,9 @@ export async function seedTopicBrowserFixtures(database) {
   })
   const storage = new SqliteStorage({ filename: database })
   try {
+    if (storage.listNamespaces().some((namespace) => namespace.startsWith('browser:topic-directory:'))) {
+      throw new Error('Topic fixtures require a fresh disposable database. Use --no-seed for a profile that is already seeded.')
+    }
     await memory.appendTurn({ user: topicBrowserFixtures.raw, assistant: '已记录，可以从事件追溯这条原文。' })
     const block = memory.listBlocks()[0]
     for (let index = 0; index < 25; index++) {
@@ -68,21 +74,44 @@ export async function seedTopicBrowserFixtures(database) {
     }
     const snapshot = memory.exportSnapshot()
     const oldIds = snapshot.memoryTopicState.topics.map(({ id }) => id)
-    snapshot.memoryTopicState.topics.forEach((topic, index) => { topic.id = topicBrowserFixtures.topicIds[index] })
+    snapshot.memoryTopicState.topics.forEach((topic, index) => {
+      topic.id = topicBrowserFixtures.topicIds[index]
+      topic.createdAt = `2026-10-01T0${index + 1}:00:00.000Z`
+    })
     for (const job of snapshot.memoryTopicState.jobs) job.topicIds = job.topicIds.map((id) => topicBrowserFixtures.topicIds[oldIds.indexOf(id)])
     const now = new Date().toISOString()
     const versions = Object.fromEntries(snapshot.events.map((event) => [event.id, memoryTopicEventFingerprint(event)]))
     const fallback = snapshot.events.find(({ id }) => !(id in snapshot.memoryTopicState.projectedVersions))
     assert.ok(fallback)
-    for (const variant of ['normal', 'pending', 'running', 'failed']) {
+    for (const variant of ['normal', 'pending', 'running', 'failed', 'ordered']) {
       const next = structuredClone(snapshot)
-      if (variant === 'normal') {
+      if (variant === 'normal' || variant === 'ordered') {
         next.memoryTopicState.bootstrap = {
           ...next.memoryTopicState.bootstrap,
           sourceVersions: { ...next.memoryTopicState.projectedVersions },
         }
       }
-      if (variant !== 'normal') {
+      if (variant === 'ordered') {
+        next.memoryTopicState.topics.forEach((topic, index) => {
+          topic.title = index === 0 ? '原有主题甲' : '原有主题乙'
+          topic.description = '按形成时间显示的主题'
+        })
+        next.memoryTopicState.topics.push({
+          id: `topic_000_${randomUUID()}`,
+          title: topicBrowserFixtures.laterTopicTitle,
+          description: '这是后来形成的新章，原有两章的顺序和编号应该保持。',
+          sourceEventIds: [fallback.id],
+          sourceVersions: { [fallback.id]: versions[fallback.id] },
+          dependencyVersions: { [fallback.id]: versions[fallback.id] },
+          projectorVersion: MEMORY_TOPIC_PROJECTOR_VERSION,
+          invalidated: false,
+          overview: [{ kind: 'scope', text: '新增主题只追加在已有主题之后。', sourceEventIds: [fallback.id] }],
+          createdAt: '2026-10-01T03:00:00.000Z',
+          updatedAt: now,
+        })
+        next.memoryTopicState.projectedVersions[fallback.id] = versions[fallback.id]
+      }
+      if (!['normal', 'ordered'].includes(variant)) {
         next.memoryTopicState.bootstrap = {
           projectorVersion: MEMORY_TOPIC_PROJECTOR_VERSION,
           sourceVersions: versions,
@@ -116,7 +145,7 @@ export async function seedTopicBrowserFixtures(database) {
     const empty = StrataGate.inMemory({ disableElementProjection: true }).exportSnapshot()
     const loaded = await storage.load(topicBrowserFixtures.empty)
     await storage.save(topicBrowserFixtures.empty, empty, loaded?.revision ?? 0)
-    return { namespaces: ['normal', 'pending', 'running', 'failed', 'empty'].map((key) => topicBrowserFixtures[key]), events: 25, topics: 2 }
+    return { namespaces: ['normal', 'pending', 'running', 'failed', 'empty', 'ordered'].map((key) => topicBrowserFixtures[key]), events: 25, topics: 2, orderedTopics: 3 }
   } finally {
     await storage.close()
     await memory.close()

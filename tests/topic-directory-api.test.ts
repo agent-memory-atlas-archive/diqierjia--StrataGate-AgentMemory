@@ -90,7 +90,7 @@ async function request(runtime: StrataGateRuntime, path = 'topics', method = 'GE
 }
 
 describe('read-only Topic Directory admin data', () => {
-  it('exposes every chapter, section and referenced Event beyond the dashboard Event page', async () => {
+  it('exposes every chapter and reference while loading Event titles in bounded pages', async () => {
     const snapshot = emptySnapshot()
     snapshot.events = Array.from({ length: 60 }, (_, index) => event(`event-${String(index).padStart(3, '0')}`))
     const state = freeze(snapshot.events)
@@ -105,16 +105,186 @@ describe('read-only Topic Directory admin data', () => {
     expect(directory.navigationOnly).toBe(true)
     expect(directory.topics.filter((item: { isFallback?: boolean }) => !item.isFallback)
       .map((item: { id: string }) => item.id)).toEqual(['topic-a', 'topic-b'])
-    expect(directory.topics).toHaveLength(12)
+    expect(directory.topics).toHaveLength(2)
     expect(directory.topics.find((item: { id: string }) => item.id === 'topic-b').overview[0].sourceEventIds).toHaveLength(20)
-    expect(directory.events).toHaveLength(60)
-    expect(directory.events.find((item: { id: string }) => item.id === 'event-059')).toMatchObject({ title: '标题 event-059' })
+    expect(directory).not.toHaveProperty('events')
+    expect(directory.pending).toEqual({ total: 10 })
+    expect(directory.revision).toMatch(/^[a-f0-9]{64}$/)
     expect(directory.context).toContain('StrataGate 记忆目录')
     expect(directory).not.toHaveProperty('batchId')
     expect(directory).not.toHaveProperty('evidenceRefs')
     expect(JSON.stringify(snapshot)).toBe(before)
     const separate = await request(fakeRuntime(snapshot))
     expect(separate.body).toEqual({ namespace, ...directory })
+    const page = await request(fakeRuntime(snapshot), 'topic-events&topicId=topic-b&sectionKey=history:0')
+    expect(page.body).toMatchObject({
+      revision: directory.revision, total: 20, offset: 0, limit: 9, nextOffset: 9,
+    })
+    expect(page.body.items).toHaveLength(9)
+    expect(page.body.items[0]).toMatchObject({ id: 'event-030', title: '标题 event-030' })
+    expect(page.body.items[0]).not.toHaveProperty('summary')
+    const pending = await request(fakeRuntime(snapshot), 'topic-events&topicId=pending&offset=9')
+    expect(pending.body).toMatchObject({ total: 10, nextOffset: null, items: [{ id: 'event-059', title: '标题 event-059' }] })
+  })
+
+  it.each([2_000, 10_000])('does not duplicate %i Event titles or summaries into the collapsed directory', async (count) => {
+    const snapshot = emptySnapshot()
+    snapshot.events = Array.from({ length: count }, (_, index) => ({
+      ...event(`event-${String(index).padStart(5, '0')}`),
+      title: `private-event-title-${index}`,
+      summary: `private-event-summary-${index} ${'长期记忆正文'.repeat(40)}`,
+    }))
+    const runtime = fakeRuntime(snapshot)
+    const result = await request(runtime, 'dashboard')
+    expect(result.status).toBe(200)
+    const directory = result.body.data.topicDirectory
+    expect(directory).not.toHaveProperty('events')
+    expect(directory.topics).toEqual([])
+    expect(directory.pending).toEqual({ total: count })
+    // Existing timeline remains a bounded page. Topic navigation may only
+    // expose a bounded directory-context sample, never the full Event payload.
+    expect(result.body.data.events).toHaveLength(40)
+    expect(JSON.stringify(directory)).not.toContain('private-event-summary-')
+    expect(JSON.stringify(result.body)).not.toContain(`private-event-title-${count - 1}`)
+    expect(JSON.stringify(result.body)).not.toContain(`private-event-summary-${count - 1}`)
+    expect(JSON.stringify(directory).length).toBeLessThan(4_000)
+    const page = await request(runtime, 'topic-events&topicId=pending&limit=10000000000000000000000000000000')
+    expect(page.body).toMatchObject({ total: count, limit: 9, offset: 0, nextOffset: 9 })
+    expect(page.body.items).toHaveLength(9)
+    for (const item of page.body.items) expect(Object.keys(item)).toEqual(['id', 'title', 'status', 'createdAt'])
+  }, 30_000)
+
+  it('retains source order for sections, uncovered members and duplicate-kind occurrences', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = Array.from({ length: 15 }, (_, index) => event(`event-${index}`))
+    const sources = [snapshot.events[9]!, snapshot.events[1]!, snapshot.events[13]!, ...snapshot.events.filter((_event, index) => ![9, 1, 13].includes(index))]
+    const stored = topic('chapter', sources)
+    stored.overview = [
+      { kind: 'history', text: '第一段脉络', sourceEventIds: sources.slice(0, 8).map(({ id }) => id) },
+      { kind: 'history', text: '第二段脉络', sourceEventIds: [sources[8]!.id] },
+    ]
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    snapshot.memoryTopicState.topics = [stored]
+    snapshot.memoryTopicState.projectedVersions = versions(snapshot.events)
+    const runtime = fakeRuntime(snapshot)
+    const members = await request(runtime, 'topic-events&topicId=chapter')
+    expect(members.body.items.map((item: { id: string }) => item.id)).toEqual(sources.slice(0, 9).map(({ id }) => id))
+    const first = await request(runtime, 'topic-events&topicId=chapter&sectionKey=history:0')
+    expect(first.body.items.map((item: { id: string }) => item.id)).toEqual(sources.slice(0, 8).map(({ id }) => id))
+    expect(first.body.nextOffset).toBeNull()
+    const second = await request(runtime, 'topic-events&topicId=chapter&sectionKey=history:1')
+    expect(second.body.items.map((item: { id: string }) => item.id)).toEqual([sources[8]!.id])
+    const uncovered = await request(runtime, 'topic-events&topicId=chapter&sectionKey=uncovered')
+    expect(uncovered.body.items.map((item: { id: string }) => item.id)).toEqual(sources.slice(9).map(({ id }) => id))
+    const later = await request(runtime, 'topic-events&topicId=chapter&offset=9')
+    expect(later.body.items.map((item: { id: string }) => item.id)).toEqual(sources.slice(9).map(({ id }) => id))
+    expect(later.body.nextOffset).toBeNull()
+    expect((await request(runtime, 'topic-events&topicId=chapter&sectionKey=history:2')).status).toBe(404)
+  })
+
+  it('keeps pending ordering predictable by creation time and ID', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = [
+      { ...event('event-late'), createdAt: '2026-10-04T00:00:00.000Z' },
+      event('event-b'), event('event-a'),
+    ]
+    const result = await request(fakeRuntime(snapshot), 'topic-events&topicId=pending')
+    expect(result.body.items.map((item: { id: string }) => item.id)).toEqual(['event-a', 'event-b', 'event-late'])
+  })
+
+  it('changes the directory revision when a Bootstrap failure scope disappears without changing Events', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = [event('pending')]
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    snapshot.memoryTopicState.jobs = [failedJob('failed-job', snapshot.events)]
+    const runtime = fakeRuntime(snapshot)
+    const first = await request(runtime)
+    expect(first.body.bootstrap.failures).toHaveLength(1)
+    const visibleBefore = JSON.stringify({ topics: first.body.topics, pending: first.body.pending, events: snapshot.events })
+    const page = await request(runtime, `topic-events&topicId=pending&sectionKey=failure:failed-job&expectedRevision=${first.body.revision}`)
+    expect(page.status).toBe(200)
+
+    snapshot.memoryTopicState.jobs = []
+    const second = await request(runtime, 'dashboard')
+    const current = second.body.data.topicDirectory
+    expect(current.bootstrap.failures).toEqual([])
+    expect(JSON.stringify({ topics: current.topics, pending: current.pending, events: snapshot.events })).toBe(visibleBefore)
+    expect(current.revision).not.toBe(first.body.revision)
+    const stalePage = await request(runtime, `topic-events&topicId=pending&sectionKey=failure:failed-job&expectedRevision=${first.body.revision}`)
+    expect(stalePage.status).toBe(409)
+    expect(stalePage.body).toMatchObject({ code: 'directory-changed', revision: current.revision })
+    expect(stalePage.body).not.toHaveProperty('items')
+    const currentScope = await request(runtime, `topic-events&topicId=pending&sectionKey=failure:failed-job&expectedRevision=${current.revision}`)
+    expect(currentScope.status).toBe(404)
+    const pendingPage = await request(runtime, `topic-events&topicId=pending&expectedRevision=${current.revision}`)
+    expect(pendingPage.body).toMatchObject({ revision: current.revision, total: 1, items: [{ id: 'pending' }] })
+  })
+
+  it('pages only the visible fallback sources of an existing terminal Bootstrap failure', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = Array.from({ length: 20 }, (_, index) => event(`event-${index}`))
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    snapshot.memoryTopicState.projectedVersions = versions(snapshot.events.slice(0, 8))
+    snapshot.memoryTopicState.topics = [topic('done', snapshot.events.slice(0, 8))]
+    const failed = snapshot.events.slice(8)
+    snapshot.memoryTopicState.jobs = [failedJob('failed-job', failed)]
+    const runtime = fakeRuntime(snapshot)
+    const first = await request(runtime, 'topic-events&topicId=pending&sectionKey=failure:failed-job')
+    expect(first.body).toMatchObject({ topicId: 'pending', sectionKey: 'failure:failed-job', total: 12, nextOffset: 9 })
+    expect(first.body.items.map((item: { id: string }) => item.id)).toEqual(failed.slice(0, 9).map(({ id }) => id))
+    const second = await request(runtime, 'topic-events&topicId=pending&sectionKey=failure:failed-job&offset=9')
+    expect(second.body.items.map((item: { id: string }) => item.id)).toEqual(failed.slice(9).map(({ id }) => id))
+    expect((await request(runtime, 'topic-events&topicId=pending&sectionKey=failure:unknown')).status).toBe(404)
+    snapshot.events[8]!.status = 'forgotten'
+    expect((await request(runtime, 'topic-events&topicId=pending&sectionKey=failure:failed-job')).status).toBe(404)
+  })
+
+  it('rejects stale directory pages after source or lane changes without writing state', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = [event('conversation')]
+    snapshot.agentEvents = [event('agent')]
+    let weight = 1
+    const runtime = fakeRuntime(snapshot, () => weight)
+    const first = await request(runtime)
+    const accepted = await request(runtime, `topic-events&topicId=pending&expectedRevision=${first.body.revision}`)
+    expect(accepted.body.revision).toBe(first.body.revision)
+    weight = 0
+    const before = JSON.stringify(snapshot)
+    const disabled = await request(runtime, `topic-events&topicId=pending&expectedRevision=${first.body.revision}`)
+    expect(disabled.status).toBe(409)
+    expect(disabled.body).toMatchObject({ code: 'directory-changed' })
+    expect(disabled.body).not.toHaveProperty('items')
+    const current = await request(runtime)
+    expect(disabled.body.revision).toBe(current.body.revision)
+    snapshot.events[0]!.title = '更新后的标题'
+    const changed = await request(runtime, `topic-events&topicId=pending&expectedRevision=${current.body.revision}`)
+    expect(changed.status).toBe(409)
+    snapshot.events[0]!.title = '标题 conversation'
+    expect(JSON.stringify(snapshot)).toBe(before)
+  })
+
+  it('binds pages to the requested namespace and rejects unknown or unbounded parameters', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = [event('kept')]
+    const runtime = fakeRuntime(snapshot)
+    for (const parameters of [
+      'topicId=pending&eventIds=kept', 'topicId=pending&limit=-1', 'topicId=pending&limit=Infinity',
+      'topicId=pending&limit=1.5', 'topicId=pending&offset=-1', 'topicId=pending&offset=1.5',
+      'topicId=pending&offset=9007199254740992', 'topicId=pending&limit=9&limit=9',
+      'topicId=pending&expectedRevision=old', 'topicId=pending&namespace=other',
+    ]) expect((await request(runtime, `topic-events&${parameters}`)).status).toBe(400)
+    expect((await request(runtime, 'topic-events')).status).toBe(400)
+    expect((await request(runtime, 'topic-events&topicId=unknown')).status).toBe(404)
+    expect((await request(runtime, 'topic-events&topicId=fallback:kept')).status).toBe(404)
+    expect((await request(runtime, 'topic-events&topicId=pending&sectionKey=uncovered')).status).toBe(404)
+    expect((await request(runtime, 'topic-events&topicId=pending&offset=9007199254740991')).body).toMatchObject({ items: [], nextOffset: null })
+    expect((await request(runtime, 'topic-events&topicId=pending&limit=0')).body.limit).toBe(1)
+    expect((await request(runtime, 'topic-events&topicId=pending', 'POST')).status).toBe(405)
+    let body = ''
+    const response: WebResponse = { statusCode: 0, setHeader: () => {}, end: (value) => { body = value } }
+    await handleAdminRequest(runtime, { method: 'GET', url: '/api/stratagate/topic-events?namespace=dsh%3Aproject%3Aother&topicId=pending' }, response)
+    expect(response.statusCode).toBe(404)
+    expect(JSON.parse(body)).not.toHaveProperty('items')
   })
 
   it('removes all cached language when a cited or uncited dependency changes', async () => {
@@ -131,8 +301,9 @@ describe('read-only Topic Directory admin data', () => {
     const serialized = JSON.stringify(result.body)
     expect(serialized).not.toContain('正式主题 topic-sensitive')
     expect(serialized).not.toContain('总览 topic-sensitive')
-    expect(result.body.topics.find((item: { id: string }) => item.id === 'topic-sensitive'))
-      .toMatchObject({ isFallback: true, overview: [], sourceEventIds: ['visible-source'] })
+    expect(result.body.topics).toEqual([])
+    expect(result.body.pending).toEqual({ total: 2 })
+    expect((await request(fakeRuntime(snapshot), 'topic-events&topicId=topic-sensitive&sectionKey=history:0')).status).toBe(404)
     expect(JSON.stringify(snapshot)).toBe(before)
   })
 
@@ -140,8 +311,11 @@ describe('read-only Topic Directory admin data', () => {
     const snapshot = emptySnapshot()
     snapshot.events = [event('kept'), { ...event('forgotten'), status: 'forgotten' }, { ...event('archived'), status: 'archived' }]
     const result = await request(fakeRuntime(snapshot))
-    expect(result.body.topics).toEqual([expect.objectContaining({ id: 'fallback:kept', isFallback: true })])
-    expect(result.body.events).toEqual([expect.objectContaining({ id: 'kept' })])
+    expect(result.body.topics).toEqual([])
+    expect(result.body.pending).toEqual({ total: 1 })
+    expect(result.body).not.toHaveProperty('events')
+    expect((await request(fakeRuntime(snapshot), 'topic-events&topicId=pending')).body.items)
+      .toEqual([expect.objectContaining({ id: 'kept' })])
     expect(result.body.bootstrap).toBeNull()
   })
 
@@ -164,8 +338,10 @@ describe('read-only Topic Directory admin data', () => {
     expect(second.status).toBe(200)
     expect(second.headers.ETag).not.toBe(first.headers.ETag)
     const directory = second.body.data.topicDirectory
-    expect(directory.topics).toEqual([expect.objectContaining({ id: 'fallback:conversation', isFallback: true })])
-    expect(directory.events.map((item: { id: string }) => item.id)).toEqual(['conversation'])
+    expect(directory.topics).toEqual([])
+    expect(directory.pending).toEqual({ total: 1 })
+    expect((await request(runtime, 'topic-events&topicId=pending')).body.items.map((item: { id: string }) => item.id)).toEqual(['conversation'])
+    expect((await request(runtime, 'topic-events&topicId=mixed')).status).toBe(404)
     expect(JSON.stringify(directory)).not.toContain('agent-only')
     expect(JSON.stringify(directory)).not.toContain('正式主题 mixed')
     expect((await request(runtime, 'sources&eventId=agent-only')).status).toBe(404)
@@ -226,7 +402,7 @@ describe('read-only Topic Directory admin data', () => {
     const result = await request(fakeRuntime(snapshot), 'dashboard')
     expect(result.body.processing).toBe(false)
     expect(result.body.data.topicDirectory).toMatchObject({
-      context: '', topics: [], events: [], bootstrap: { status: 'completed', total: 0, completed: 0, failedEvents: 0 },
+      context: '', topics: [], pending: { total: 0 }, bootstrap: { status: 'completed', total: 0, completed: 0, failedEvents: 0 },
     })
   })
 
@@ -261,11 +437,11 @@ describe('read-only Topic Directory admin data', () => {
     } as unknown as DshModelBridge)
     try {
       const before = await runtime.adminSnapshot(namespace)
-      for (const path of ['topics', 'dashboard', 'sources&eventId=legacy-event']) {
+      for (const path of ['topics', 'dashboard', 'topic-events&topicId=pending', 'sources&eventId=legacy-event']) {
         const result = await request(runtime, path)
         expect(result.status).toBe(200)
         if (path === 'topics') expect(result.body).toMatchObject({
-          topics: [{ id: 'fallback:legacy-event', isFallback: true }], bootstrap: null,
+          topics: [], pending: { total: 1 }, bootstrap: null,
         })
       }
       expect(await runtime.adminSnapshot(namespace)).toEqual(before)

@@ -267,6 +267,7 @@ window.__ModuleLoader__.load({
       .sg-topic-event{display:flex;align-items:center;gap:10px;width:100%;min-width:0;min-height:33px;padding:6px 8px;border:0;border-radius:5px;background:transparent;text-align:left;cursor:pointer}.sg-topic-event-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.sg-topic-event-arrow{flex:0 0 auto;color:var(--sg-muted);font-size:12px;opacity:0;transition:opacity var(--sg-fast) var(--sg-ease)}.sg-topic-event:hover .sg-topic-event-arrow,.sg-topic-event:focus-visible .sg-topic-event-arrow{opacity:1}.sg-topic-show-all{display:block;margin:5px 0 3px;padding:5px 8px;border:0;border-radius:5px;background:transparent;color:var(--sg-accent)!important;font-size:11px!important;cursor:pointer}.sg-topic-show-all:hover{background:var(--sg-soft)}.sg-topic-other-events{margin:7px 8px 0;color:var(--sg-muted);font-size:12px}.sg-topic-other-events>summary{padding:5px 0;cursor:pointer}.sg-topic-no-overview{margin:4px 8px;color:var(--sg-muted);font-size:12px}
       .sg-directory-fold{display:grid;grid-template-rows:0fr;opacity:0;visibility:hidden;transition:grid-template-rows var(--sg-medium) var(--sg-ease),opacity var(--sg-medium) var(--sg-ease),visibility 0s var(--sg-medium)}.sg-directory-fold.open{grid-template-rows:1fr;opacity:1;visibility:visible;transition-delay:0s}.sg-directory-fold-inner{min-height:0;overflow:hidden}.sg-directory-fold:not(.open){pointer-events:none}.sg-topic-bootstrap{margin:14px 0 1px;padding:9px 0 9px 12px;border-left:2px solid var(--sg-accent);transition:border-color var(--sg-medium) var(--sg-ease),background-color var(--sg-medium) var(--sg-ease)}.sg-topic-bootstrap.attention{border-color:var(--sg-warn)}.sg-topic-bootstrap-line{display:flex;align-items:center;gap:8px;min-width:0;font-size:12px;font-variant-numeric:tabular-nums}.sg-topic-bootstrap-line>span:nth-child(2){flex:1}.sg-topic-warning{color:var(--sg-warn)}.sg-topic-bootstrap-copy{margin:3px 0 0 22px;color:var(--sg-muted);font-size:11px;line-height:1.6}.sg-topic-status-details{flex:0 0 auto;padding:2px 4px;border:0;border-radius:4px;background:transparent;color:var(--sg-accent)!important;font-size:11px!important;cursor:pointer}.sg-topic-status-details:hover{background:var(--sg-soft)}.sg-topic-failures{padding:9px 0 0 22px;color:var(--sg-muted);font-size:12px}.sg-topic-failure{padding:7px 0;border-top:1px solid var(--sg-border)}.sg-topic-failure>p{margin:0 0 3px}.sg-topic-failure-technical{margin:4px 8px;font-size:11px}.sg-topic-failure-technical summary{cursor:pointer}.sg-topic-failure-technical p{white-space:pre-wrap;overflow-wrap:anywhere}
       .sg-topic-pending{padding:20px 0 0}.sg-topic-pending-heading{display:flex;align-items:baseline;gap:10px}.sg-topic-pending-heading h2{margin:0;font-size:13px;font-weight:650}.sg-topic-pending-heading span{color:var(--sg-muted);font-size:11px}.sg-topic-pending>p{margin:4px 0 8px;color:var(--sg-muted);font-size:12px}.sg-topic-pending-mark{width:12px;color:var(--sg-muted);text-align:center}.sg-topic-empty{padding:27px 0;color:var(--sg-muted);font-size:13px}.sg-topic-empty h3{margin:0 0 4px;color:var(--sg-text);font-size:14px;font-weight:650}.sg-topic-empty p{margin:0}.sg-long-tabs{max-width:100%;flex-wrap:wrap}.sg-long-tabs button{padding-inline:16px}
+      .sg-topic-pending-heading{margin:0}.sg-topic-pending-toggle{display:flex;align-items:center;gap:10px;width:100%;min-width:0;padding:6px 2px;border:0;border-radius:5px;background:transparent;text-align:left;cursor:pointer}.sg-topic-pending-toggle:hover{background:var(--sg-soft)}.sg-topic-pending-toggle>span:first-child{color:var(--sg-text);font-size:13px;font-weight:650}.sg-topic-pending .sg-directory-fold-inner>p{margin:4px 2px 8px;color:var(--sg-muted);font-size:12px}.sg-topic-read-status,.sg-topic-read-error{margin:5px 8px;color:var(--sg-muted);font-size:11px;line-height:1.6}.sg-topic-read-error{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sg-topic-read-error button{padding:3px 5px;border:0;border-radius:4px;background:transparent;color:var(--sg-accent);font-size:11px;cursor:pointer}.sg-topic-read-error button:hover{background:var(--sg-soft)}.sg-topic-show-all:disabled{color:var(--sg-muted)!important;cursor:wait;opacity:.6}
       @media(max-width:650px){.sg-topic-chapter-header{grid-template-columns:34px minmax(0,1fr);gap:6px}.sg-topic-chapter-number{font-size:22px}.sg-topic-chapter-copy h2{font-size:15px}.sg-topic-chapter-toggle{flex-wrap:wrap;column-gap:8px;row-gap:0}.sg-topic-chapter-title{flex:1 1 calc(100% - 80px)}.sg-topic-sections{padding-left:23px}.sg-topic-section-body{margin-left:9px;padding-left:8px}.sg-topic-overview-text{padding-left:8px}.sg-topic-bootstrap-line{flex-wrap:wrap}.sg-topic-bootstrap-line>span:nth-child(2){flex-basis:calc(100% - 35px)}.sg-topic-status-details{margin-left:18px}.sg-long-tabs button{padding:7px 12px;font-size:12px}}
       .sg-topic-directory{min-width:0;container-name:sg-topic-directory;container-type:inline-size}.sg-topic-section-toggle>span:nth-child(2),.sg-topic-overview-toggle>span:nth-child(2){min-width:0}
       @container sg-topic-directory (max-width:320px){.sg-topic-chapter-header{grid-template-columns:26px minmax(0,1fr);gap:4px}.sg-topic-chapter-number{font-size:19px}.sg-topic-chapter-copy h2{font-size:14px}.sg-topic-chapter-toggle{display:grid;grid-template-columns:minmax(0,1fr) 18px;gap:0 4px}.sg-topic-chapter-label{grid-column:1;font-size:11px}.sg-topic-chapter-title{grid-column:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sg-topic-chapter-toggle>.sg-directory-chevron{grid-column:2;grid-row:2}.sg-topic-sections{padding-left:12px}.sg-topic-section-toggle,.sg-topic-overview-toggle{gap:5px;padding:6px 2px}.sg-topic-section-toggle>span:nth-child(2){flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.sg-topic-section-body{margin-left:0;padding-left:4px}.sg-directory-number{min-width:2.7em;font-size:11px;white-space:nowrap}.sg-topic-overview-text{padding:0 2px;font-size:12px}.sg-topic-event{gap:5px;padding:6px 2px}.sg-topic-event-title{font-size:11px}.sg-topic-description{font-size:11px}.sg-topic-show-all{margin-left:0;padding-left:2px;padding-right:2px;max-width:100%}.sg-topic-failures{padding-left:2px}.sg-topic-bootstrap-copy{margin-left:2px}}
@@ -463,7 +464,12 @@ window.__ModuleLoader__.load({
       let attempt = 0
       const request = () => fetch(url, { cache: 'no-store', ...options })
         .then((res) => res.json().catch(() => ({})).then((data) => {
-          if (!res.ok) throw new Error((data && data.error) || 'HTTP ' + res.status)
+          if (!res.ok) {
+            const error = new Error((data && data.error) || 'HTTP ' + res.status)
+            error.status = res.status
+            error.code = data?.code
+            throw error
+          }
           return data
         }))
         .catch((reason) => {
@@ -474,7 +480,10 @@ window.__ModuleLoader__.load({
             attempt += 1
             return new Promise((resolve) => window.setTimeout(resolve, attempt * 300)).then(request)
           }
-          throw new Error(message + '（' + path + '）')
+          const error = new Error(message + '（' + path + '）')
+          error.status = reason?.status
+          error.code = reason?.code
+          throw error
         })
       return request()
     }
@@ -2096,10 +2105,13 @@ window.__ModuleLoader__.load({
     // section open when its text or source list changes in a dashboard refresh.
     function topicSections(topic) {
       const occurrences = new Map()
+      const totals = new Map()
+      for (const part of topic.overview || []) totals.set(part.kind, (totals.get(part.kind) || 0) + 1)
       return (topic.overview || []).map((part) => {
         const occurrence = occurrences.get(part.kind) || 0
         occurrences.set(part.kind, occurrence + 1)
-        return { ...part, uiKey: String(part.kind) + ':' + occurrence }
+        const title = TOPIC_SECTION_TITLES[part.kind] || '主题概览'
+        return { ...part, uiKey: String(part.kind) + ':' + occurrence, uiTitle: title + (totals.get(part.kind) > 1 ? '（' + chapterOrdinal(occurrence + 1) + '）' : '') }
       })
     }
 
@@ -2126,26 +2138,94 @@ window.__ModuleLoader__.load({
       h('span', { className: 'sg-topic-event-title' }, event.title || event.summary || '记忆事件'), h('span', { className: 'sg-topic-event-arrow', 'aria-hidden': 'true' }, '↗'))
     }
 
-    function TopicSection({ part, chapter, index, topicId, eventById, openEvent }) {
+    function useTopicEventPages({ namespace, revision, topicId, sectionKey = '', total, active, wantAll, onDirectoryChanged }) {
+      const key = JSON.stringify([namespace, revision, topicId, sectionKey])
+      const empty = { key, epoch: 0, items: [], total, nextOffset: total ? 0 : null, loading: false, error: '' }
+      const [state, setState] = React.useState(empty)
+      const [retry, setRetry] = React.useState(0)
+      const requestRef = React.useRef({ key, epoch: 0, generation: 0, controller: null })
+      const changedRef = React.useRef(onDirectoryChanged)
+      changedRef.current = onDirectoryChanged
+      if (requestRef.current.key !== key) {
+        requestRef.current.controller?.abort()
+        requestRef.current = { key, epoch: requestRef.current.epoch + 1, generation: requestRef.current.generation + 1, controller: null }
+      }
+      // Old rows disappear in the same render as a workspace or revision change,
+      // before a promise or a later effect can return its previous result.
+      const epoch = requestRef.current.epoch
+      const current = state.key === key && state.epoch === epoch ? state : { ...empty, epoch }
+      React.useEffect(() => {
+        if (!active || !revision || !total) return undefined
+        if (current.error || (current.items.length && (!wantAll || current.nextOffset === null))) return undefined
+        const controller = new AbortController()
+        const generation = ++requestRef.current.generation
+        requestRef.current.controller = controller
+        const valid = () => !controller.signal.aborted && requestRef.current.key === key && requestRef.current.generation === generation
+        let items = current.items
+        let nextOffset = current.nextOffset ?? 0
+        let pageTotal = current.total
+        setState({ ...current, loading: true, error: '' })
+        const read = async () => {
+          do {
+            const offset = nextOffset
+            const page = await api('topic-events', { namespace, topicId, ...(sectionKey ? { sectionKey } : {}), offset, limit: 9, expectedRevision: revision }, { signal: controller.signal })
+            if (!valid()) return
+            if (page.revision !== revision || page.namespace !== namespace || page.topicId !== topicId || String(page.sectionKey || '') !== sectionKey) {
+              const error = new Error('目录已更新')
+              error.code = 'directory-changed'
+              throw error
+            }
+            if (!Array.isArray(page.items) || page.items.length > 9 || Number(page.offset) !== offset || (page.nextOffset !== null && (!Number.isSafeInteger(page.nextOffset) || page.nextOffset <= offset))) throw new Error('事件分页响应无效')
+            items = [...items, ...page.items]
+            pageTotal = Number(page.total || 0)
+            nextOffset = page.nextOffset
+            setState({ key, epoch, items, total: pageTotal, nextOffset, loading: wantAll && nextOffset !== null, error: '' })
+          } while (wantAll && nextOffset !== null && valid())
+        }
+        void read().catch((reason) => {
+          if (!valid() || reason?.name === 'AbortError') return
+          if (reason?.code === 'directory-changed' || reason?.status === 409 || reason?.status === 404) {
+            setState({ key, epoch, items: [], total, nextOffset: 0, loading: false, error: '目录已有更新，正在读取最新目录。' })
+            changedRef.current?.()
+          } else setState({ key, epoch, items, total: pageTotal, nextOffset, loading: false, error: '暂时无法读取事件，请重试。' })
+        })
+        return () => {
+          controller.abort()
+          requestRef.current.generation += 1
+          setState((previous) => previous.key === key && previous.epoch === epoch && previous.loading ? { ...previous, loading: false } : previous)
+        }
+      }, [key, active, wantAll, retry])
+      return { ...current, items: revision ? (wantAll ? current.items : current.items.slice(0, 9)) : [], retry: () => { setState({ ...current, error: '' }); setRetry((value) => value + 1) } }
+    }
+
+    function TopicEventList({ namespace, revision, topicId, sectionKey = '', total, active, openEvent, numberPrefix, onDirectoryChanged, expandLabel, collapseLabel = '收起多余事件' }) {
+      const [showAll, setShowAll] = React.useState(false)
+      const page = useTopicEventPages({ namespace, revision, topicId, sectionKey, total, active, wantAll: showAll, onDirectoryChanged })
+      return h('div', { className: 'sg-topic-event-list', 'data-topic-event-scope': topicId + ':' + sectionKey },
+        page.items.map((event, index) => h(TopicEventRow, { key: event.id, event, number: numberPrefix ? numberPrefix + '.' + (index + 1) : undefined, openEvent })),
+        page.loading ? h('p', { className: 'sg-topic-read-status', role: 'status' }, showAll ? '正在读取事件 · ' + page.items.length + ' / ' + page.total : '正在读取事件…') : null,
+        page.error ? h('div', { className: 'sg-topic-read-error', role: 'alert' }, h('span', null, page.error), h('button', { type: 'button', onClick: page.retry }, '重新读取事件')) : null,
+        page.total > 9 ? h('button', { type: 'button', className: 'sg-topic-show-all', disabled: !showAll && (page.loading || Boolean(page.error)), 'aria-expanded': showAll, onClick: () => setShowAll((value) => !value) }, showAll ? collapseLabel : '还有 ' + (page.total - 9) + ' 条事件 · ' + (expandLabel || '展开全部')) : null)
+    }
+
+    function TopicSection({ part, chapter, index, topicId, namespace, revision, active, openEvent, onDirectoryChanged }) {
       const [open, setOpen] = React.useState(false)
       const [overviewOpen, setOverviewOpen] = React.useState(true)
-      const [showAll, setShowAll] = React.useState(false)
       const sectionNumber = chapter + '.' + index
       const regionId = 'sg-topic-' + encodeURIComponent(topicId) + '-' + encodeURIComponent(part.uiKey)
       const sourceIds = [...new Set(part.sourceEventIds || [])]
-      const visibleIds = showAll ? sourceIds : sourceIds.slice(0, 9)
       return h('section', { className: 'sg-topic-section', 'data-section-index': String(index) },
-        h('h3', { className: 'sg-topic-section-heading' }, h('button', { type: 'button', className: 'sg-topic-section-toggle', title: TOPIC_SECTION_TITLES[part.kind] || '主题概览', 'aria-expanded': open, 'aria-controls': regionId, onClick: () => setOpen((current) => !current) },
-          h('span', { className: 'sg-directory-number' }, sectionNumber), h('span', null, TOPIC_SECTION_TITLES[part.kind] || '主题概览'), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
+        h('h3', { className: 'sg-topic-section-heading' }, h('button', { type: 'button', className: 'sg-topic-section-toggle', title: part.uiTitle, 'aria-expanded': open, 'aria-controls': regionId, onClick: () => setOpen((current) => !current) },
+          h('span', { className: 'sg-directory-number' }, sectionNumber), h('span', null, part.uiTitle), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
         h(DirectoryFold, { open, id: regionId }, h('div', { className: 'sg-topic-section-body' },
           h('div', { className: 'sg-topic-overview' }, h('h4', { className: 'sg-topic-overview-heading' }, h('button', { type: 'button', className: 'sg-topic-overview-toggle', 'aria-expanded': overviewOpen, 'aria-controls': regionId + '-overview', onClick: () => setOverviewOpen((current) => !current) }, h('span', { className: 'sg-directory-number' }, sectionNumber + '.0'), h('span', null, '总览'), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
             h(DirectoryFold, { open: overviewOpen, id: regionId + '-overview' }, h('p', { className: 'sg-topic-overview-text' }, part.text || '暂无总览'))),
-          visibleIds.map((id, eventIndex) => h(TopicEventRow, { key: id, number: sectionNumber + '.' + (eventIndex + 1), event: eventById.get(id) || { id, title: '记忆事件 · ' + id.slice(0, 8) }, openEvent })),
-          sourceIds.length > 9 ? h('button', { type: 'button', className: 'sg-topic-show-all', 'aria-expanded': showAll, onClick: () => setShowAll((current) => !current) }, showAll ? '收起多余事件' : '还有 ' + (sourceIds.length - 9) + ' 条事件 · 展开全部') : null)))
+          h(TopicEventList, { namespace, revision, topicId, sectionKey: part.uiKey, total: sourceIds.length, active: active && open, openEvent, numberPrefix: sectionNumber, onDirectoryChanged }))))
     }
 
-    function TopicChapter({ topic, number, eventById, openEvent }) {
+    function TopicChapter({ topic, number, namespace, revision, active, openEvent, onDirectoryChanged }) {
       const [open, setOpen] = React.useState(true)
+      const [otherOpen, setOtherOpen] = React.useState(false)
       const regionId = 'sg-topic-chapter-' + encodeURIComponent(topic.id)
       const chapterLabel = '第' + chapterOrdinal(number) + '章'
       return h('article', { className: 'sg-topic-chapter', 'data-topic-id': topic.id },
@@ -2153,16 +2233,16 @@ window.__ModuleLoader__.load({
           h('span', { className: 'sg-topic-chapter-number', 'aria-hidden': 'true' }, String(number).padStart(2, '0')),
           h('div', { className: 'sg-topic-chapter-copy' }, h('h2', null, h('button', { type: 'button', className: 'sg-topic-chapter-toggle', title: topic.title, 'aria-expanded': open, 'aria-controls': regionId, 'aria-label': chapterLabel + ' ' + topic.title, onClick: () => setOpen((current) => !current) }, h('span', { className: 'sg-topic-chapter-label' }, chapterLabel), h('span', { className: 'sg-topic-chapter-title' }, topic.title), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))), topic.description ? h('p', { className: 'sg-topic-description' }, topic.description) : null)),
         h(DirectoryFold, { open, id: regionId }, h('div', { className: 'sg-topic-sections' },
-          topicSections(topic).map((part, index) => h(TopicSection, { key: part.uiKey, part, chapter: number, index: index + 1, topicId: topic.id, eventById, openEvent })),
+          topicSections(topic).map((part, index) => h(TopicSection, { key: part.uiKey, part, chapter: number, index: index + 1, topicId: topic.id, namespace, revision, active: active && open, openEvent, onDirectoryChanged })),
           !(topic.overview || []).length ? h('p', { className: 'sg-topic-no-overview' }, '这个主题暂无总览，可查看关联事件。') : null,
           (() => {
             const summarized = new Set((topic.overview || []).flatMap((part) => part.sourceEventIds || []))
             const remaining = (topic.sourceEventIds || []).filter((id) => !summarized.has(id))
-            return remaining.length ? h('details', { className: 'sg-topic-other-events' }, h('summary', null, '其他关联事件 · ' + remaining.length), remaining.map((id) => h(TopicEventRow, { key: id, event: eventById.get(id) || { id, title: '记忆事件 · ' + id.slice(0, 8) }, openEvent }))) : null
+            return remaining.length ? h('details', { className: 'sg-topic-other-events', open: otherOpen, onToggle: (event) => setOtherOpen(event.currentTarget.open) }, h('summary', null, '其他关联事件 · ' + remaining.length), h(TopicEventList, { namespace, revision, topicId: topic.id, sectionKey: 'uncovered', total: remaining.length, active: active && open && otherOpen, openEvent, onDirectoryChanged })) : null
           })())))
     }
 
-    function TopicBootstrapNotice({ bootstrap, eventById, openEvent }) {
+    function TopicBootstrapNotice({ bootstrap, namespace, revision, active, openEvent, onDirectoryChanged }) {
       const [detailsOpen, setDetailsOpen] = React.useState(false)
       if (!bootstrap || Number(bootstrap.total || 0) === 0) return null
       const failures = Number(bootstrap.failedEvents || 0)
@@ -2176,29 +2256,34 @@ window.__ModuleLoader__.load({
         working && failures ? h('p', { className: 'sg-topic-bootstrap-copy' }, failures + ' 条历史记忆暂未完成整理') : null,
         h(DirectoryFold, { open: detailsOpen, id: 'sg-topic-bootstrap-details' }, h('div', { className: 'sg-topic-failures' },
           (bootstrap.failures || []).map((failure) => h('div', { key: failure.jobId, className: 'sg-topic-failure' }, h('p', null, '自动整理已停止' + (failure.attempts ? ' · 已尝试 ' + failure.attempts + ' 次' : '')),
-            (failure.eventIds || []).map((id) => h(TopicEventRow, { key: id, event: eventById.get(id) || { id, title: '记忆事件 · ' + id.slice(0, 8) }, openEvent })), failure.lastError ? h('details', { className: 'sg-topic-failure-technical' }, h('summary', null, '技术详情'), h('p', null, failure.lastError)) : null)),
+            h(TopicEventList, { namespace, revision, topicId: 'pending', sectionKey: 'failure:' + failure.jobId, total: (failure.eventIds || []).length, active: active && detailsOpen, openEvent, onDirectoryChanged }), failure.lastError ? h('details', { className: 'sg-topic-failure-technical' }, h('summary', null, '技术详情'), h('p', null, failure.lastError)) : null)),
           !(bootstrap.failures || []).length ? h('p', null, '部分历史记忆暂未形成主题，请从下方待整理事件或事件时间线查看。') : null)))
     }
 
-    function TopicDirectory({ directory, openEvent }) {
-      const [pendingAll, setPendingAll] = React.useState(false)
-      const eventById = React.useMemo(() => new Map((directory?.events || []).map((event) => [event.id, event])), [directory?.events])
+    function TopicDirectory({ directory, namespace, active = true, openEvent, onDirectoryChanged }) {
+      const [pendingOpen, setPendingOpen] = React.useState(false)
+      const [invalidatedRevision, setInvalidatedRevision] = React.useState(null)
+      const revision = directory?.revision || ''
+      const blocked = invalidatedRevision === revision
+      // A successful dashboard read is a fresh snapshot even if content changed
+      // away and back to the same hash before the refresh completed.
+      React.useEffect(() => { setInvalidatedRevision(null) }, [directory])
+      const pageRevision = blocked ? '' : revision
+      const invalidate = React.useCallback(() => { setInvalidatedRevision(revision); return onDirectoryChanged?.() }, [revision, onDirectoryChanged])
       const topics = directory?.topics || []
-      const chapters = topics.filter((topic) => !topic.isFallback)
-      const pendingIds = [...new Set(topics.filter((topic) => topic.isFallback).flatMap((topic) => topic.sourceEventIds || []))]
-      const visiblePending = pendingAll ? pendingIds : pendingIds.slice(0, 9)
+      const pendingTotal = Number(directory?.pending?.total || 0)
       return h('section', { className: 'sg-topic-directory', 'data-testid': 'stratagate-topic-directory', 'aria-label': '主题目录' },
         h('header', { className: 'sg-topic-directory-intro' }, h('h2', null, '默认注入上下文'), h('p', null, '轻量目录默认进入上下文，帮助 Agent 找到记忆主题；具体事实仍来自事件和知识图谱。'),
-          directory?.context ? h('details', { className: 'sg-topic-context' }, h('summary', null, '查看目录内容'), h('pre', null, directory.context)) : null),
-        h(TopicBootstrapNotice, { bootstrap: directory?.bootstrap, eventById, openEvent }),
-        !directory ? h('p', { className: 'sg-topic-empty', role: 'status' }, '暂时无法读取主题目录，请稍后重新打开。') : !chapters.length && !pendingIds.length ? h('div', { className: 'sg-topic-empty' }, h('h3', null, '还没有长期记忆'), h('p', null, '产生长期事件后，主题会在这里逐步整理成目录。')) : null,
-        chapters.map((topic, index) => h(TopicChapter, { key: topic.id, topic, number: index + 1, eventById, openEvent })),
-        pendingIds.length ? h('section', { className: 'sg-topic-pending', 'aria-label': '待整理事件' }, h('div', { className: 'sg-topic-pending-heading' }, h('h2', null, '待整理'), h('span', null, pendingIds.length + ' 条事件')), h('p', null, '这些记忆尚未形成稳定主题，仍可直接查看原事件。'),
-          visiblePending.map((id) => h(TopicEventRow, { key: id, event: eventById.get(id) || { id, title: '记忆事件 · ' + id.slice(0, 8) }, openEvent })),
-          pendingIds.length > 9 ? h('button', { type: 'button', className: 'sg-topic-show-all', 'aria-expanded': pendingAll, onClick: () => setPendingAll((current) => !current) }, pendingAll ? '收起待整理事件' : '还有 ' + (pendingIds.length - 9) + ' 条事件 · 查看全部待整理') : null) : null)
+          directory?.context && !blocked ? h('details', { className: 'sg-topic-context' }, h('summary', null, '查看目录内容'), h('pre', null, directory.context)) : null),
+        blocked ? h('p', { className: 'sg-topic-read-error', role: 'status' }, '目录已有更新，正在重新读取。', h('button', { type: 'button', onClick: onDirectoryChanged }, '重新读取目录')) : null,
+        h('div', { hidden: blocked }, h(TopicBootstrapNotice, { bootstrap: directory?.bootstrap, namespace, revision: pageRevision, active: active && !blocked, openEvent, onDirectoryChanged: invalidate }),
+          !directory ? h('p', { className: 'sg-topic-empty', role: 'status' }, '暂时无法读取主题目录，请稍后重新打开。') : !topics.length && !pendingTotal ? h('div', { className: 'sg-topic-empty' }, h('h3', null, '还没有长期记忆'), h('p', null, '产生长期事件后，主题会在这里逐步整理成目录。')) : null,
+          topics.map((topic, index) => h(TopicChapter, { key: topic.id, topic, number: index + 1, namespace, revision: pageRevision, active: active && !blocked, openEvent, onDirectoryChanged: invalidate })),
+          pendingTotal ? h('section', { className: 'sg-topic-pending', 'aria-label': '待整理事件' }, h('h2', { className: 'sg-topic-pending-heading' }, h('button', { type: 'button', className: 'sg-topic-pending-toggle', 'aria-expanded': pendingOpen, 'aria-controls': 'sg-topic-pending-events', onClick: () => setPendingOpen((value) => !value) }, h('span', null, '待整理'), h('span', null, pendingTotal + ' 条事件'), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
+            h(DirectoryFold, { open: pendingOpen, id: 'sg-topic-pending-events' }, h('p', null, '这些记忆尚未形成稳定主题，仍可直接查看原事件。'), h(TopicEventList, { namespace, revision: pageRevision, topicId: 'pending', total: pendingTotal, active: active && !blocked && pendingOpen, openEvent, onDirectoryChanged: invalidate, expandLabel: '查看全部待整理', collapseLabel: '收起待整理事件' }))) : null))
     }
 
-    function LongTermPage({ events, eventPage, graph, project, query, setQuery, openEvent, namespace, focusNodeId, onFocusHandled, topicDirectory, active = true }) {
+    function LongTermPage({ events, eventPage, graph, project, query, setQuery, openEvent, namespace, focusNodeId, onFocusHandled, topicDirectory, onDirectoryChanged, active = true }) {
       const [mode, setMode] = React.useState('topics')
       const [selectedNodeId, setSelectedNodeId] = React.useState('')
       const [selectedEventId, setSelectedEventId] = React.useState('')
@@ -2280,7 +2365,7 @@ window.__ModuleLoader__.load({
           h('select', { value: eventFilters.status, onChange: (event) => setEventFilters({ ...eventFilters, status: event.target.value }), 'aria-label': '事件状态' }, h('option', { value: '' }, '全部状态'), Object.entries(EVENT_STATUS_TEXT).map(([value, label]) => h('option', { key: value, value }, label))))
       return h('section', { className: 'sg-long-explorer ' + (fullScreen ? 'fullscreen' : ''), 'aria-label': fullScreen ? '长期记忆全屏探索' : '长期记忆浏览' },
         h('nav', { className: 'sg-long-tabs', 'aria-label': '长期记忆视角' }, [['topics', '主题目录'], ['graph', '知识图谱'], ['timeline', '事件时间线']].map(([id, label]) => h('button', { key: id, type: 'button', className: mode === id ? 'active' : '', 'aria-current': mode === id ? 'page' : undefined, onClick: () => { setMode(id); if (id === 'topics') { setFullScreen(false); setFiltersOpen(false) } } }, label))),
-        h('div', { hidden: mode !== 'topics' }, h(TopicDirectory, { directory: topicDirectory, openEvent })),
+        h('div', { hidden: mode !== 'topics' }, h(TopicDirectory, { directory: topicDirectory, namespace, active: active && mode === 'topics', openEvent, onDirectoryChanged })),
         mode === 'topics' ? null : h(React.Fragment, null,
         migrationState !== 'complete' ? h('div', { className: 'sg-migration ' + (migrationState === 'processing' ? 'processing' : 'attention'), role: 'status' }, h('span', { className: 'sg-processing-icon', 'aria-hidden': 'true' }, migrationState === 'processing' ? '↻' : '⚠'), h('span', null, migrationNotice), h('small', null, migrationState === 'processing' ? '后台图谱投影仍在继续。' : migrationState === 'failed' ? '查看详情并手动重试。' : '查看详情。')) : null,
         h('div', { className: 'sg-long-toolbar' },
@@ -3660,7 +3745,7 @@ window.__ModuleLoader__.load({
 
       const loadDashboard = React.useCallback((activeNamespace, options = {}) => {
         const background = options.background === true
-        if (background && dashboardRequestRef.current) return Promise.resolve(null)
+        if (background && !options.force && dashboardRequestRef.current) return Promise.resolve(null)
         dashboardRequestRef.current?.abort()
         const controller = new AbortController()
         dashboardRequestRef.current = controller
@@ -3671,6 +3756,7 @@ window.__ModuleLoader__.load({
           ...(activeNamespace ? { namespace: activeNamespace } : {}),
           ...(options.threadId ? { threadId: options.threadId } : {}),
         }, { etag: options.force ? '' : dashboardEtagsRef.current.get(key), signal: controller.signal }).then((result) => {
+          if (controller.signal.aborted || dashboardRequestRef.current !== controller) return null
           if (result.etag) dashboardEtagsRef.current.set(key, result.etag)
           if (result.notModified || !result.data) return null
           const next = result.data
@@ -3687,12 +3773,14 @@ window.__ModuleLoader__.load({
           setError('')
           return next
         }).catch((reason) => {
+          if (controller.signal.aborted || dashboardRequestRef.current !== controller) return null
           if (reason?.name !== 'AbortError') reportError(reason)
           if (options.propagateError === true && reason?.name !== 'AbortError') throw reason
           return null
         }).finally(() => {
-          if (dashboardRequestRef.current === controller) dashboardRequestRef.current = null
-          if (!background) setLoading(false)
+          if (dashboardRequestRef.current !== controller) return
+          dashboardRequestRef.current = null
+          setLoading(false)
         })
       }, [])
 
@@ -3843,6 +3931,7 @@ window.__ModuleLoader__.load({
       }
       const backLabel = view.back?.name === 'block' ? '短期记忆' : view.back?.name === 'event' ? '长期记忆' : view.back?.name === 'structure' ? '记忆结构' : section === 'short' ? '短期记忆' : '长期记忆'
       const refresh = (options = {}) => loadDashboard(namespace, { threadId: conversationId, force: true, ...options })
+      const refreshDirectory = React.useCallback(() => loadDashboard(namespace, { threadId: conversationId, background: true, force: true }), [namespace, conversationId, loadDashboard])
       const selectConversation = (nextConversationId) => {
         setConversationId(nextConversationId)
         return loadDashboard(namespace, { threadId: nextConversationId, force: true })
@@ -3893,7 +3982,7 @@ window.__ModuleLoader__.load({
         error ? h('div', { className: 'sg-error' }, h('div', { className: 'sg-error-title' }, '暂时无法读取完整记忆'), h('div', null, '已显示能够读取的内容，请稍后重新加载。'), h('details', null, h('summary', null, '技术详情'), h('div', { className: 'sg-code' }, error))) : null,
         view.name === 'status' ? null : h(MemoryStatusAlert, { overview: error ? null : selected, onOpen: (stage) => setView({ name: 'status', stage }) }),
         h('section', { key: section, className: 'sg-view', 'aria-label': 'StrataGate 记忆内容' }, section === 'long' && selected && loadedNamespaceRef.current === namespace ? h(React.Fragment, null,
-          h('div', { key: 'long-browser', hidden: view.name !== 'root' }, h(LongTermPage, { key: namespace, events: data.events, eventPage: data.pagination?.events, graph: data.graph, project, query, setQuery, openEvent, namespace, focusNodeId: graphFocusNodeId, onFocusHandled: consumeGraphFocus, topicDirectory: data.topicDirectory, active: view.name === 'root' })),
+          h('div', { key: 'long-browser', hidden: view.name !== 'root' }, h(LongTermPage, { key: namespace, events: data.events, eventPage: data.pagination?.events, graph: data.graph, project, query, setQuery, openEvent, namespace, focusNodeId: graphFocusNodeId, onFocusHandled: consumeGraphFocus, topicDirectory: data.topicDirectory, onDirectoryChanged: refreshDirectory, active: view.name === 'root' })),
           view.name === 'root' ? null : content) : content),
         h('footer', { className: 'sg-footer' }, '发现问题？ ', h('button', { type: 'button', onClick: () => { setSection('more'); setView({ name: 'support' }); setSource(null) } }, '提交反馈')))
     }

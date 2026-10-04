@@ -40,9 +40,17 @@ function categoryOf(topic: MemoryTopic, events: ReadonlyMap<string, EventCard>):
   return [...CATEGORIES].sort((a, b) => (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0))[0]!.id
 }
 
+/** Chapters follow creation order; newly created topics append rather than
+ * moving an existing chapter because their generated id sorts earlier. */
+export function sortMemoryTopics(topics: readonly MemoryTopic[]): MemoryTopic[] {
+  return [...topics].sort((a, b) => Number(a.isFallback === true) - Number(b.isFallback === true)
+    || a.createdAt.localeCompare(b.createdAt)
+    || a.title.localeCompare(b.title, 'zh-CN') || a.id.localeCompare(b.id))
+}
+
 export function topicNavigation(topics: readonly MemoryTopic[], events: readonly EventCard[]) {
   const byId = new Map(events.map((event) => [event.id, event]))
-  const entries = topics.map((topic) => ({
+  const entries = sortMemoryTopics(topics).map((topic) => ({
     id: topic.id,
     title: topic.title,
     description: topic.description,
@@ -50,7 +58,7 @@ export function topicNavigation(topics: readonly MemoryTopic[], events: readonly
     sourceEventCount: topic.sourceEventIds.length,
     coverage: topic.coverage,
     isFallback: topic.isFallback === true,
-  })).sort((a, b) => a.category.localeCompare(b.category) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id))
+  }))
   const categories = CATEGORIES.map((category) => ({
     ...category,
     count: entries.filter((entry) => entry.category === category.id).length,
@@ -92,13 +100,15 @@ export function renderMemoryDirectory(topics: readonly MemoryTopic[], events: re
   // Every branch remains reachable even when a large catalog cannot fit the prompt.
   const branches = categories.map(({ id, label, count }) => `${id}（${label} ${count}）`).join('；')
   const navigation = `${header}\n共 ${entries.length} 项；分类：${branches}。完整目录用 memory_list_topics(category, offset) 分页；query 可查主题。下列为部分入口：`
-  const selected: string[] = []
+  const selected: Array<{ id: string; line: string }> = []
   for (const category of categories) {
     const entry = entries.find((item) => item.category === category.id)!
     const line = `- ${entry.id}：${lineText(entry.title, 40)}`
-    if (estimateTokens(`${navigation}\n${[...selected, line].join('\n')}`) <= MEMORY_DIRECTORY_TOKEN_BUDGET) selected.push(line)
+    if (estimateTokens(`${navigation}\n${[...selected.map(({ line }) => line), line].join('\n')}`) <= MEMORY_DIRECTORY_TOKEN_BUDGET) selected.push({ id: entry.id, line })
   }
-  return `${navigation}\n${selected.join('\n')}`.trim()
+  const order = new Map(entries.map(({ id }, index) => [id, index]))
+  selected.sort((a, b) => order.get(a.id)! - order.get(b.id)!)
+  return `${navigation}\n${selected.map(({ line }) => line).join('\n')}`.trim()
 }
 
 export function boundedTopic(topic: MemoryTopic, envelope: Record<string, unknown> = {}) {

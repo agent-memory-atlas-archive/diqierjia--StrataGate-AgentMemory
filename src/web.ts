@@ -25,7 +25,7 @@ import {
 } from '@diqier/stratagate'
 import type { AdminSnapshotEntry, FeedbackDraftInput, StrataGateRuntime } from './runtime.js'
 import { clusterKnowledgeGraph } from './graph-clustering.js'
-import { renderMemoryDirectory } from './topics.js'
+import { renderMemoryDirectory, sortMemoryTopics } from './topics.js'
 
 const LEGACY_THREAD_ID = '__legacy__'
 const nodeRequire = createRequire(import.meta.url)
@@ -476,13 +476,13 @@ async function requiredSnapshot(runtime: StrataGateRuntime, namespace: string): 
 }
 
 class AdminHttpError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string, readonly details?: Record<string, unknown>) {
     super(message)
   }
 }
 
 /** Rebuild the display on a clone, without opening a writer or claiming work. */
-function topicDirectoryView(snapshot: StrataGateSnapshot, agentMemoryWeight: number) {
+function topicDirectoryProjection(snapshot: StrataGateSnapshot, agentMemoryWeight: number) {
   const visibleEvents = [...snapshot.events, ...(agentMemoryWeight > 0 ? snapshot.agentEvents : [])]
     .filter((event) => event.status === 'active' || event.status === 'superseded')
   const directory = new MemoryTopicDirectory()
@@ -496,9 +496,12 @@ function topicDirectoryView(snapshot: StrataGateSnapshot, agentMemoryWeight: num
     topics = topics.filter((topic) => !topic.isFallback)
     const assigned = new Set(topics.flatMap((topic) => topic.sourceEventIds))
     topics.push(...new MemoryTopicDirectory().list(visibleEvents.filter(({ id }) => !assigned.has(id))))
-    topics.sort((left, right) => left.id.localeCompare(right.id))
   }
-  const eventIds = new Set(topics.flatMap((topic) => topic.sourceEventIds))
+  topics = sortMemoryTopics(topics)
+  const chapters = topics.filter((topic) => !topic.isFallback)
+  const pendingIds = new Set(topics.filter((topic) => topic.isFallback).flatMap((topic) => topic.sourceEventIds))
+  const pending = visibleEvents.filter(({ id }) => pendingIds.has(id))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
   const versions = new Map(visibleEvents.map((event) => [event.id, memoryTopicEventFingerprint(event)]))
   const frozen = state.bootstrap?.projectorVersion === MEMORY_TOPIC_PROJECTOR_VERSION ? state.bootstrap : null
   // Changed, forgotten, archived or disabled-lane sources no longer belong to
@@ -522,19 +525,33 @@ function topicDirectoryView(snapshot: StrataGateSnapshot, agentMemoryWeight: num
       updatedAt: job.updatedAt,
     }] : []
   })
+  const bootstrap = frozen ? {
+    status: frozen.status,
+    total: history.length,
+    completed: history.length - outstanding.size,
+    failedEvents: new Set(failures.flatMap(({ eventIds }) => eventIds)).size,
+    failures,
+  } : null
+  // Failure pages are directory scopes too: a job-only change must invalidate
+  // their cached token even when every Event and chapter remains unchanged.
+  const revision = createHash('sha256').update(JSON.stringify({
+    topics: chapters,
+    pending: pending.map(({ id }) => id),
+    versions: [...versions].sort(([left], [right]) => left.localeCompare(right)),
+    bootstrap,
+    agentMemoryWeight,
+  })).digest('hex')
   return {
-    navigationOnly: true as const,
-    context: renderMemoryDirectory(topics, visibleEvents),
-    topics,
-    events: visibleEvents.filter((event) => eventIds.has(event.id))
-      .map(({ id, title, summary, status, createdAt, updatedAt }) => ({ id, title, summary, status, createdAt, updatedAt })),
-    bootstrap: frozen ? {
-      status: frozen.status,
-      total: history.length,
-      completed: history.length - outstanding.size,
-      failedEvents: new Set(failures.flatMap(({ eventIds }) => eventIds)).size,
-      failures,
-    } : null,
+    visibleEvents,
+    pending,
+    data: {
+      navigationOnly: true as const,
+      revision,
+      context: renderMemoryDirectory(topics, visibleEvents),
+      topics: chapters,
+      pending: { total: pending.length },
+      bootstrap,
+    },
   }
 }
 
@@ -542,7 +559,88 @@ async function topicDirectory(runtime: StrataGateRuntime, url: URL): Promise<unk
   const namespace = url.searchParams.get('namespace')?.trim() ?? ''
   if (!namespace) throw new AdminHttpError(400, 'namespace is required')
   const snapshot = await requiredSnapshot(runtime, namespace)
-  return { namespace, ...topicDirectoryView(snapshot, runtime.adminAgentMemoryRetrievalWeight?.() ?? 1) }
+  return { namespace, ...topicDirectoryProjection(snapshot, runtime.adminAgentMemoryRetrievalWeight?.() ?? 1).data }
+}
+
+const TOPIC_EVENT_PAGE_LIMIT = 9
+
+function topicEventPageNumber(url: URL, name: 'offset' | 'limit', fallback: number): number {
+  const value = url.searchParams.get(name)
+  if (value === null) return fallback
+  if (!/^\d{1,32}$/.test(value)) throw new AdminHttpError(400, `${name} must be a non-negative integer`)
+  const parsed = Number(value)
+  if (name === 'offset' && !Number.isSafeInteger(parsed)) {
+    throw new AdminHttpError(400, 'offset must be a safe integer')
+  }
+  return name === 'limit' ? Math.max(1, Math.min(TOPIC_EVENT_PAGE_LIMIT, parsed)) : parsed
+}
+
+/** Only current topic-owned references can be paged; arbitrary IDs are never accepted. */
+async function topicEvents(runtime: StrataGateRuntime, url: URL): Promise<unknown> {
+  const allowed = new Set(['namespace', 'topicId', 'sectionKey', 'offset', 'limit', 'expectedRevision'])
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+      throw new AdminHttpError(400, 'Unknown or repeated topic Event parameter')
+    }
+  }
+  const namespace = url.searchParams.get('namespace')?.trim() ?? ''
+  const topicId = url.searchParams.get('topicId')?.trim() ?? ''
+  const sectionKey = url.searchParams.get('sectionKey')?.trim() || null
+  const expectedRevision = url.searchParams.get('expectedRevision')
+  if (!namespace) throw new AdminHttpError(400, 'namespace is required')
+  if (!topicId) throw new AdminHttpError(400, 'topicId is required')
+  if (namespace.length > 512 || topicId.length > 512 || (sectionKey?.length ?? 0) > 512) {
+    throw new AdminHttpError(400, 'Topic Event parameter is too long')
+  }
+  if (expectedRevision !== null && !/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new AdminHttpError(400, 'expectedRevision must be a directory revision')
+  }
+  const offset = topicEventPageNumber(url, 'offset', 0)
+  const limit = topicEventPageNumber(url, 'limit', TOPIC_EVENT_PAGE_LIMIT)
+  const snapshot = await requiredSnapshot(runtime, namespace)
+  const projection = topicDirectoryProjection(snapshot, runtime.adminAgentMemoryRetrievalWeight?.() ?? 1)
+  const { data } = projection
+  if (expectedRevision !== null && expectedRevision !== data.revision) {
+    throw new AdminHttpError(409, 'Memory directory changed; reload the directory before reading more Events', {
+      code: 'directory-changed', revision: data.revision,
+    })
+  }
+  let ids: string[]
+  if (topicId === 'pending') {
+    if (sectionKey === null) ids = projection.pending.map(({ id }) => id)
+    else if (sectionKey.startsWith('failure:')) {
+      const failure = data.bootstrap?.failures.find(({ jobId }) => jobId === sectionKey.slice('failure:'.length))
+      if (!failure) throw new AdminHttpError(404, 'Unknown or unavailable Topic failure')
+      const pendingIds = new Set(projection.pending.map(({ id }) => id))
+      ids = failure.eventIds.filter((id) => pendingIds.has(id))
+    } else throw new AdminHttpError(404, 'Unknown or unavailable pending Topic section')
+  } else {
+    const topic = data.topics.find(({ id }) => id === topicId)
+    if (!topic) throw new AdminHttpError(404, 'Unknown or unavailable memory topic')
+    if (sectionKey === null) ids = topic.sourceEventIds
+    else if (sectionKey === 'uncovered') {
+      const covered = new Set(topic.overview.flatMap((part) => part.sourceEventIds))
+      ids = topic.sourceEventIds.filter((id) => !covered.has(id))
+    } else {
+      const occurrences = new Map<string, number>()
+      const part = topic.overview.find((candidate) => {
+        const occurrence = occurrences.get(candidate.kind) ?? 0
+        occurrences.set(candidate.kind, occurrence + 1)
+        return `${candidate.kind}:${occurrence}` === sectionKey
+      })
+      if (!part) throw new AdminHttpError(404, 'Unknown or unavailable memory topic section')
+      const members = new Set(topic.sourceEventIds)
+      ids = part.sourceEventIds.filter((id) => members.has(id))
+    }
+  }
+  const byId = new Map(projection.visibleEvents.map((event) => [event.id, event]))
+  const sources = [...new Set(ids)].flatMap((id) => byId.get(id) ?? [])
+  const page = sources.slice(offset, offset + limit)
+  return {
+    namespace, revision: data.revision, topicId, sectionKey, total: sources.length, offset, limit,
+    nextOffset: offset + page.length < sources.length ? offset + page.length : null,
+    items: page.map(({ id, title, status, createdAt }) => ({ id, title, status, createdAt })),
+  }
 }
 
 async function overview(runtime: StrataGateRuntime, cachedEntries?: readonly AdminSnapshotEntry[]): Promise<unknown> {
@@ -1511,7 +1609,7 @@ async function dashboard(runtime: StrataGateRuntime, url: URL, ifNoneMatch: stri
   ]) as [any, any, any, any]
   const selectedOverview = (overviewValue as { namespaces?: Array<{ namespace: string; processingJobs?: number }> })
     .namespaces?.find(({ namespace }) => namespace === selected.namespace)
-  const topicDirectoryData = topicDirectoryView(selected.snapshot, agentMemoryWeight)
+  const topicDirectoryData = topicDirectoryProjection(selected.snapshot, agentMemoryWeight).data
   return {
     etag,
     notModified: false,
@@ -1598,6 +1696,7 @@ export async function handleAdminRequest(runtime: StrataGateRuntime, req: WebReq
     else if (path === '/api/stratagate/overview') sendJson(res, 200, await overview(runtime))
     else if (path === '/api/stratagate/memories') sendJson(res, 200, await memories(runtime, url))
     else if (path === '/api/stratagate/topics') sendJson(res, 200, await topicDirectory(runtime, url))
+    else if (path === '/api/stratagate/topic-events') sendJson(res, 200, await topicEvents(runtime, url))
     else if (path === '/api/stratagate/sources') sendJson(res, 200, await sources(runtime, url))
     else if (path === '/api/stratagate/audit') sendJson(res, 200, await audit(runtime, url))
     else if (path === '/api/stratagate/agent-memories') {
@@ -1611,7 +1710,7 @@ export async function handleAdminRequest(runtime: StrataGateRuntime, req: WebReq
   } catch (error) {
     const status = error instanceof AdminHttpError ? error.status : 500
     const message = error instanceof Error ? error.message : String(error)
-    sendJson(res, status, { error: message })
+    sendJson(res, status, { error: message, ...(error instanceof AdminHttpError ? error.details : {}) })
   }
 }
 

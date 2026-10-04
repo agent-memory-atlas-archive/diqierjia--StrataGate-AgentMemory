@@ -28,14 +28,28 @@ const requests = []
 const errors = []
 const screenshots = []
 const checks = []
+const topicPages = []
+const directories = []
+const responseReads = []
 try {
   const context = await browser.newContext({ viewport: { width: 1280, height: 1000 }, colorScheme: 'light', locale: 'zh-CN' })
   const page = await context.newPage()
   page.setDefaultTimeout(15000)
   page.on('pageerror', (error) => errors.push(error.message))
   page.on('request', (request) => {
-    const pathname = new URL(request.url()).pathname
-    if (pathname.startsWith('/api/stratagate/')) requests.push({ method: request.method(), pathname })
+    const url = new URL(request.url())
+    const pathname = url.pathname
+    if (pathname.startsWith('/api/stratagate/')) requests.push({ method: request.method(), pathname,
+      ...(pathname === '/api/stratagate/topic-events' ? Object.fromEntries(['namespace', 'topicId', 'sectionKey', 'offset', 'limit', 'expectedRevision'].map((key) => [key, url.searchParams.get(key) ?? (key === 'offset' ? '0' : null)])) : {}),
+    })
+  })
+  page.on('response', (response) => {
+    const pathname = new URL(response.url()).pathname
+    if (pathname === '/api/stratagate/topic-events' && response.ok()) {
+      responseReads.push(response.json().then((data) => { topicPages.push(data) }))
+    } else if (pathname === '/api/stratagate/dashboard' && response.ok()) {
+      responseReads.push(response.json().then((data) => { if (data.data?.topicDirectory) directories.push(data.data.topicDirectory) }))
+    }
   })
   const capture = async (name) => {
     const path = join(outputDirectory, `${name}.png`)
@@ -82,6 +96,10 @@ try {
   assert.equal(await directory.locator('.sg-topic-chapter').count(), 2)
   assert.match(await chapter(0).textContent(), /第一章/)
   assert.match(await chapter(1).textContent(), /第二章/)
+  const topicRequests = (topicId, sectionKey) => requests.filter((request) => request.pathname === '/api/stratagate/topic-events'
+    && request.namespace === fixtures.normal && request.topicId === topicId && request.sectionKey === sectionKey)
+  assert.equal(requests.filter(({ pathname }) => pathname === '/api/stratagate/topic-events').length, 0, 'Collapsed directory eagerly fetched Event rows')
+  checks.push('collapsed-directory-fetches-no-topic-event-pages')
   await capture('topic-directory-initial-desktop-light')
   const section = (chapterIndex, sectionIndex) => chapter(chapterIndex).locator(`.sg-topic-section[data-section-index="${sectionIndex}"]`)
   const openSection = async (chapterIndex, sectionIndex) => {
@@ -89,10 +107,16 @@ try {
     const toggle = target.locator('button').first()
     if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click()
     await target.getByRole('button', { name: `${chapterIndex + 1}.${sectionIndex}.0 总览`, exact: true }).waitFor()
+    const expected = chapterIndex === 0 ? [8, 9, 9, 1][sectionIndex - 1] : [1, 9, 9, 1, 9, 9, 1, 9][sectionIndex - 1]
+    await page.waitForFunction(({ id, sectionIndex, expected }) => {
+      const section = document.querySelector(`[data-topic-id="${id}"] .sg-topic-section[data-section-index="${sectionIndex}"]`)
+      return section?.querySelectorAll('.sg-topic-event[data-topic-event-id]').length === expected
+    }, { id: fixtures.topicIds[chapterIndex], sectionIndex, expected })
     return target
   }
   const eventRows = (target) => target.locator('.sg-topic-event[data-topic-event-id]:visible')
   const eight = await openSection(0, 1)
+  assert.deepEqual(topicRequests(fixtures.topicIds[0], 'history:0').map(({ offset, limit }) => [offset, limit]), [['0', '9']])
   assert.equal(await eventRows(eight).count(), 8)
   assert.equal(await eight.getByRole('button', { name: /展开全部/ }).count(), 0)
   assert.equal(await eight.getByRole('button', { name: '1.1.0 总览', exact: true }).getAttribute('aria-expanded'), 'true')
@@ -119,16 +143,25 @@ try {
   assert.equal(await sectionToggle.getAttribute('aria-expanded'), 'true')
   assert.equal(await overviewToggle.getAttribute('aria-expanded'), 'true')
   checks.push('chapter-section-and-overview-collapse-reopen-preserves-state')
+  assert.equal(topicRequests(fixtures.topicIds[0], 'history:0').length, 1, 'Reopening unchanged section refetched its cached first page')
   const nine = await openSection(0, 2)
   assert.equal(await eventRows(nine).count(), 9)
   assert.equal(await nine.getByRole('button', { name: /展开全部/ }).count(), 0)
+  assert.deepEqual(topicRequests(fixtures.topicIds[0], 'decision:0').map(({ offset, limit }) => [offset, limit]), [['0', '9']])
   const twelve = await openSection(0, 3)
+  assert.deepEqual(topicRequests(fixtures.topicIds[0], 'change:0').map(({ offset, limit }) => [offset, limit]), [['0', '9']])
   assert.equal(await eventRows(twelve).count(), 9)
   await twelve.getByRole('button', { name: '还有 3 条事件 · 展开全部', exact: true }).click()
+  await page.waitForFunction((id) => document.querySelector(`[data-topic-id="${id}"] [data-section-index="3"]`)?.querySelectorAll('.sg-topic-event').length === 12, fixtures.topicIds[0])
   assert.equal(await eventRows(twelve).count(), 12)
+  assert.deepEqual(topicRequests(fixtures.topicIds[0], 'change:0').map(({ offset, limit }) => [offset, limit]), [['0', '9'], ['9', '9']])
   assert.equal(await eventRows(twelve).nth(11).locator('.sg-directory-number').textContent(), '1.3.12')
   await twelve.getByRole('button', { name: '收起多余事件', exact: true }).click()
   assert.equal(await eventRows(twelve).count(), 9)
+  await twelve.getByRole('button', { name: '还有 3 条事件 · 展开全部', exact: true }).click()
+  assert.equal(await eventRows(twelve).count(), 12)
+  assert.equal(topicRequests(fixtures.topicIds[0], 'change:0').length, 2, 'Expand-all discarded the cached second page')
+  await twelve.getByRole('button', { name: '收起多余事件', exact: true }).click()
   const one = await openSection(0, 4)
   assert.equal(await eventRows(one).count(), 1)
   assert.equal(await one.getByRole('button', { name: /展开全部/ }).count(), 0)
@@ -157,6 +190,9 @@ try {
   const fallback = directory.locator('.sg-topic-pending')
   await fallback.getByText('待整理', { exact: true }).waitFor()
   assert.equal(await fallback.locator('.sg-topic-chapter').count(), 0)
+  assert.equal(await fallback.locator('[data-topic-event-id]:visible').count(), 0, 'Pending events should start collapsed')
+  await fallback.locator('.sg-topic-pending-toggle').click()
+  await fallback.locator('[data-topic-event-id]').first().waitFor()
   await fallback.locator('[data-topic-event-id]').first().click()
   await memory.locator('.sg-event-page-header').waitFor()
   await memory.locator('.sg-back').click()
@@ -195,6 +231,145 @@ try {
   assert.equal(await directory.locator('.sg-topic-chapter').count(), 0)
   checks.push('real-dashboard-delay-never-shows-previous-namespace-topics')
 
+  await selectNamespace(fixtures.normal)
+  let releaseOldPage
+  let oldPageIntercepted
+  let oldPageServed
+  const oldPageGate = new Promise((resolve) => { releaseOldPage = resolve })
+  const oldPageReady = new Promise((resolve) => { oldPageIntercepted = resolve })
+  const oldPageDone = new Promise((resolve) => { oldPageServed = resolve })
+  let holdOldPage = true
+  const eventPagePattern = /\/api\/stratagate\/topic-events(?:\?|$)/
+  const delayOldPage = async (route) => {
+    const url = new URL(route.request().url())
+    if (holdOldPage && url.searchParams.get('namespace') === fixtures.normal && url.searchParams.get('topicId') === fixtures.topicIds[1]) {
+      holdOldPage = false
+      // Fetch the real server response unchanged, then delay its delivery.
+      const response = await route.fetch()
+      oldPageIntercepted()
+      await oldPageGate
+      await route.fulfill({ response }).catch(() => {})
+      oldPageServed()
+    } else await route.continue()
+  }
+  await page.route(eventPagePattern, delayOldPage)
+  await section(1, 1).locator('.sg-topic-section-toggle').click()
+  await oldPageReady
+  try {
+    await selectNamespace(fixtures.empty)
+    await directory.waitFor()
+    assert.equal(await directory.locator('.sg-topic-chapter').count(), 0)
+  } finally {
+    releaseOldPage()
+    await oldPageDone
+    await page.unroute(eventPagePattern, delayOldPage)
+  }
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  assert.equal(await directory.locator('.sg-topic-event').count(), 0, 'A late Event page repopulated another namespace')
+  checks.push('late-real-event-page-cannot-repopulate-another-namespace')
+
+  // A genuine browser network failure is transient. Switching away and back
+  // must reread the real page rather than preserving an old error forever.
+  await selectNamespace(fixtures.pending)
+  let abortedPageRequests = 0
+  const abortPage = async (route) => {
+    const url = new URL(route.request().url())
+    if (url.searchParams.get('namespace') === fixtures.pending
+      && url.searchParams.get('topicId') === fixtures.topicIds[0] && url.searchParams.get('sectionKey') === 'history:0') {
+      abortedPageRequests += 1
+      await route.abort('failed')
+    } else await route.continue()
+  }
+  await page.route(eventPagePattern, abortPage)
+  try {
+    await section(0, 1).locator('.sg-topic-section-toggle').click()
+    await section(0, 1).getByText('暂时无法读取事件，请重试。', { exact: true }).waitFor()
+    assert.ok(abortedPageRequests > 0, 'Network interruption fixture did not intercept a real request')
+  } finally {
+    await page.unroute(eventPagePattern, abortPage)
+  }
+  await selectNamespace(fixtures.empty)
+  assert.equal(await directory.locator('.sg-topic-read-error:visible').count(), 0)
+  await selectNamespace(fixtures.pending)
+  await openSection(0, 1)
+  assert.equal(await eventRows(section(0, 1)).count(), 8)
+  assert.equal(await directory.locator('.sg-topic-read-error:visible').count(), 0, 'Returning to a workspace retained its old network error')
+  checks.push('network-abort-then-workspace-roundtrip-retries-without-old-errors')
+
+  // Make the real server reject a stale revision, preserving its complete
+  // response. Hold the ensuing real dashboard GET to inspect blocked UI, then
+  // let the unchanged current revision return and require fresh Event rows.
+  await selectNamespace(fixtures.running)
+  await directory.locator('.sg-topic-context summary').click()
+  await directory.locator('.sg-topic-context pre').waitFor()
+  let releaseConflictDashboard
+  let conflictDashboardIntercepted
+  const conflictDashboardGate = new Promise((resolve) => { releaseConflictDashboard = resolve })
+  const conflictDashboardReady = new Promise((resolve) => { conflictDashboardIntercepted = resolve })
+  let holdConflictDashboard = true
+  const delayConflictDashboard = async (route) => {
+    if (holdConflictDashboard && new URL(route.request().url()).searchParams.get('namespace') === fixtures.running) {
+      holdConflictDashboard = false
+      conflictDashboardIntercepted()
+      await conflictDashboardGate
+    }
+    await route.continue()
+  }
+  let rejectFirstPage = true
+  let currentConflictRevision
+  const rejectStalePage = async (route) => {
+    const url = new URL(route.request().url())
+    if (rejectFirstPage && url.searchParams.get('namespace') === fixtures.running
+      && url.searchParams.get('topicId') === fixtures.topicIds[0] && url.searchParams.get('sectionKey') === 'history:0') {
+      rejectFirstPage = false
+      const revision = url.searchParams.get('expectedRevision')
+      url.searchParams.set('expectedRevision', (revision[0] === 'a' ? 'b' : 'a') + revision.slice(1))
+      const response = await route.fetch({ url: url.toString() })
+      assert.equal(response.status(), 409, 'Real server did not reject a stale directory revision')
+      const data = await response.json()
+      assert.equal(data.code, 'directory-changed')
+      assert.equal(data.revision, revision)
+      currentConflictRevision = data.revision
+      await route.fulfill({ response })
+    } else await route.continue()
+  }
+  await page.route(dashboardPattern, delayConflictDashboard)
+  await page.route(eventPagePattern, rejectStalePage)
+  const refreshedDashboard = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/stratagate/dashboard' && url.searchParams.get('namespace') === fixtures.running && response.ok()
+  })
+  try {
+    await section(0, 1).locator('.sg-topic-section-toggle').click()
+    await conflictDashboardReady
+    await directory.getByRole('status').filter({ hasText: '目录已有更新，正在重新读取。' }).waitFor()
+    assert.equal(await directory.locator('.sg-topic-chapter:visible').count(), 0, 'Blocked directory exposed old chapters')
+    assert.equal(await directory.locator('.sg-topic-context').count(), 0, 'Blocked directory exposed its stale injected context')
+  } finally {
+    releaseConflictDashboard()
+    const refreshed = await (await refreshedDashboard).json()
+    assert.equal(refreshed.data.topicDirectory.revision, currentConflictRevision, 'Conflict fixture unexpectedly changed the durable directory')
+    await page.unroute(dashboardPattern, delayConflictDashboard)
+    await page.unroute(eventPagePattern, rejectStalePage)
+  }
+  await section(0, 1).locator('.sg-topic-event').first().waitFor()
+  assert.equal(await eventRows(section(0, 1)).count(), 8)
+  assert.equal(await directory.locator('.sg-topic-read-error:visible').count(), 0, 'Fresh same-revision dashboard did not unblock its directory')
+  await directory.locator('.sg-topic-context summary').waitFor()
+  checks.push('real-409-hides-context-and-fresh-same-revision-dashboard-recovers')
+
+  await selectNamespace(fixtures.ordered)
+  await directory.locator('.sg-topic-chapter').nth(2).waitFor()
+  const chapterOrder = await directory.locator('.sg-topic-chapter').evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-topic-id')))
+  assert.deepEqual(chapterOrder.slice(0, 2), fixtures.topicIds)
+  assert.ok(chapterOrder[2].localeCompare(fixtures.topicIds[0]) < 0, 'Ordering fixture must include a lexically earlier random id')
+  assert.match(await directory.locator('.sg-topic-chapter').nth(2).textContent(), /第三章/)
+  await directory.locator('.sg-topic-context summary').click()
+  const injectedContext = await directory.locator('.sg-topic-context pre').textContent()
+  const contextOffsets = chapterOrder.map((id) => injectedContext.indexOf(id))
+  assert.ok(contextOffsets[0] >= 0 && contextOffsets[0] < contextOffsets[1] && contextOffsets[1] < contextOffsets[2], 'UI and injected directory chapter ordering diverged')
+  checks.push('later-random-front-id-appends-chapter-and-context-in-identical-order')
+
   for (const variant of ['pending', 'running', 'failed', 'normal', 'empty']) {
     await selectNamespace(fixtures[variant])
     await directory.waitFor()
@@ -214,6 +389,11 @@ try {
   checks.push('bootstrap-pending-running-completed-failed-empty')
 
   await selectNamespace(fixtures.normal)
+  assert.match(await section(1, 1).locator('.sg-topic-section-toggle').textContent(), /发展脉络.*（一）/)
+  assert.match(await section(1, 6).locator('.sg-topic-section-toggle').textContent(), /发展脉络.*（二）/)
+  assert.match(await section(1, 2).locator('.sg-topic-section-toggle').textContent(), /关键设计决策.*（一）/)
+  assert.match(await section(1, 7).locator('.sg-topic-section-toggle').textContent(), /关键设计决策.*（二）/)
+  checks.push('duplicate-section-kinds-have-distinct-static-ordinal-labels')
   for (let index = 1; index <= 4; index++) await openSection(0, index)
   for (let index = 1; index <= 8; index++) await openSection(1, index)
   await directory.evaluate(async (element) => {
@@ -325,14 +505,22 @@ try {
   assert.ok(requests.length > 0)
   assert.ok(requests.some(({ pathname }) => pathname === '/api/stratagate/sources'))
   assert.deepEqual(requests.filter(({ method }) => method !== 'GET'), [], 'Browsing must not perform memory mutations')
-  const readonlyRoutes = new Set(['dashboard', 'overview', 'profile', 'sources', 'memories', 'topics', 'settings'].map((name) => '/api/stratagate/' + name))
+  const readonlyRoutes = new Set(['dashboard', 'overview', 'profile', 'sources', 'memories', 'topics', 'topic-events', 'settings'].map((name) => '/api/stratagate/' + name))
   assert.deepEqual(requests.filter(({ pathname }) => !readonlyRoutes.has(pathname)), [], 'Browsing invoked a retrieval tool, adoption or model endpoint')
+  await Promise.all(responseReads)
+  assert.ok(directories.length > 0 && directories.every((directory) => !('events' in directory) && directory.topics.every((topic) => !topic.isFallback)), 'Dashboard exposed an eager Event index or per-Event fallback topics')
+  assert.ok(topicPages.length > 0 && topicPages.every((result) => result.items.length <= 9 && result.limit <= 9 && typeof result.revision === 'string'))
+  for (const result of topicPages) {
+    for (const item of result.items) assert.deepEqual(Object.keys(item).sort(), ['createdAt', 'id', 'status', 'title'])
+  }
+  assert.ok(requests.filter(({ pathname }) => pathname === '/api/stratagate/topic-events').every((request) => request.limit === '9' && request.expectedRevision), 'Event pages omitted the directory revision guard or exceeded nine items')
+  checks.push('dashboard-has-no-eager-event-index-and-all-pages-are-shallow-bounded-revision-guarded')
   assert.deepEqual(durableBrowserSnapshot(database), baseline, 'Browsing changed memory, model receipts, weights, topic state or integration metadata')
   assert.deepEqual(errors, [], 'Browser page raised an uncaught JavaScript exception')
   checks.push('get-only-and-all-durable-tables-unchanged-no-model-or-adoption-records')
-  const result = { result: 'passed', checks, screenshots, themes: { light: lightTheme, dark: darkTheme }, requests, errors, outputDirectory }
+  const result = { result: 'passed', checks, screenshots, themes: { light: lightTheme, dark: darkTheme }, requests, topicPages, errors, outputDirectory }
   await writeFile(join(outputDirectory, 'topic-directory-browser-review.json'), JSON.stringify(result, null, 2) + '\n')
-  console.log(JSON.stringify(result))
+  console.log(JSON.stringify({ ...result, topicPages: topicPages.map(({ topicId, sectionKey, offset, limit, total, items }) => ({ topicId, sectionKey, offset, limit, total, count: items.length })) }))
 } catch (error) {
   const page = browser.contexts()[0]?.pages()[0]
   if (page) {
@@ -348,7 +536,7 @@ try {
         ancestors: saved.ancestors.map(({ node, top, left }) => ({ className: node.className, actual: node.scrollTop, expected: top, actualLeft: node.scrollLeft, expectedLeft: left, connected: node.isConnected })),
       }
     }).catch(() => null)
-    await writeFile(join(outputDirectory, 'topic-directory-failure.json'), JSON.stringify({ checks, scroll, errors }, null, 2) + '\n').catch(() => {})
+    await writeFile(join(outputDirectory, 'topic-directory-failure.json'), JSON.stringify({ checks, scroll, errors, error: String(error), requests, topicPages }, null, 2) + '\n').catch(() => {})
     console.error(JSON.stringify({ completedChecks: checks, scroll }))
   }
   throw error
