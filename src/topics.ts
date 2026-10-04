@@ -45,7 +45,7 @@ function categoryOf(topic: MemoryTopic, events: ReadonlyMap<string, EventCard>):
 export function sortMemoryTopics(topics: readonly MemoryTopic[]): MemoryTopic[] {
   return [...topics].sort((a, b) => Number(a.isFallback === true) - Number(b.isFallback === true)
     || a.createdAt.localeCompare(b.createdAt)
-    || a.title.localeCompare(b.title, 'zh-CN') || a.id.localeCompare(b.id))
+    || a.id.localeCompare(b.id))
 }
 
 export function topicNavigation(topics: readonly MemoryTopic[], events: readonly EventCard[]) {

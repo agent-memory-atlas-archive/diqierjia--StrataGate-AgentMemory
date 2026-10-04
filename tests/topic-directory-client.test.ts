@@ -91,13 +91,35 @@ function clientRenderer(runEffects = false, fetchOverride?: any) {
     window: { __ModuleLoader__: { load: (value: any) => { definition = value } }, setTimeout: () => 0, clearTimeout: () => {}, addEventListener: () => {}, removeEventListener: () => {} },
   })
   const components = definition.factory(() => React).__topicTest
+  // Raw relations belong to the mock server; actual UI components receive the
+  // same count-only contract as Dashboard. Preserve snapshot identity so the
+  // conflict/recovery tests still exercise real directory refresh behavior.
+  const directoryViews = new WeakMap<object, { fingerprint: string; view: any }>()
+  const directoryView = (directory: any) => {
+    const fingerprint = JSON.stringify(directory)
+    const cached = directoryViews.get(directory)
+    if (cached?.fingerprint === fingerprint) return cached.view
+    const view = { ...directory, topics: directory.topics.map((topic: any) => {
+      const { sourceEventIds, overview, ...navigation } = topic
+      const ids = sourceEventIds ? [...new Set<string>(sourceEventIds)] : null
+      const summarized = new Set<string>(overview.flatMap((part: any) => part.sourceEventIds || []))
+      return { ...navigation,
+        coverage: ids ? { totalEvents: ids.length, summarizedEvents: ids.filter((id) => summarized.has(id)).length, omittedEvents: ids.filter((id) => !summarized.has(id)).length } : topic.coverage,
+        overview: overview.map(({ sourceEventIds: references, ...part }: any) => ({ ...part, sourceEventCount: references ? new Set(references).size : part.sourceEventCount })),
+      }
+    }), bootstrap: directory.bootstrap ? { ...directory.bootstrap, failures: directory.bootstrap.failures.map(({ eventIds, ...failure }: any) => ({ ...failure, eventCount: eventIds ? new Set(eventIds).size : failure.eventCount })) } : null }
+    directoryViews.set(directory, { fingerprint, view })
+    return view
+  }
   const renderNode = (value: any, path: string, visible: boolean): Rendered | null => {
     if (value === null || value === undefined || value === false) return null
     if (typeof value !== 'object') return { type: '#text', props: {}, children: [], text: String(value), visible }
     if (typeof value.type === 'function') {
       const previous = current
       current = { path, index: 0, callbackIndex: 0 }
-      const element = value.type({ ...value.props, children: value.children })
+      const props = { ...value.props, children: value.children }
+      if (value.type === components.TopicDirectory && props.directory) props.directory = directoryView(props.directory)
+      const element = value.type(props)
       current = previous
       return renderNode(element, path + '/body', visible)
     }
@@ -155,6 +177,31 @@ function pageReply(url: string, items: any[], total: number, nextOffset: number 
 }
 
 describe('Topic Directory client interactions', () => {
+  it('uses count-only navigation for a large uncovered section and lazily reads its first nine rows', async () => {
+    const client = clientRenderer(true, async (url: string) => {
+      const parsed = new URL(url, 'http://localhost')
+      expect(parsed.searchParams.get('sectionKey')).toBe('uncovered')
+      return pageReply(url, eventFixture().slice(8, 17), 9_992, 9)
+    })
+    const directory = { ...fixture(), topics: [{
+      id: 'large-topic', title: '大型正式主题', description: '完整关系仅在服务端',
+      coverage: { totalEvents: 10_000, summarizedEvents: 8, omittedEvents: 9_992 },
+      overview: [{ kind: 'history', text: '八条事件总览', sourceEventCount: 8 }],
+    }] }
+    const props = { directory, namespace: 'dsh:project:test', openEvent: vi.fn() }
+    let tree = client.render(client.TopicDirectory, props)
+    expect(client.fetch).toHaveBeenCalledTimes(0)
+    const details = find(tree, (node) => node.props.className === 'sg-topic-other-events')[0]!
+    expect(details.text).toContain('其他关联事件 · 9992')
+    details.props.onToggle({ currentTarget: { open: true } })
+    client.render(client.TopicDirectory, props)
+    await client.flush()
+    tree = client.render(client.TopicDirectory, props)
+    expect(buttons(tree).filter((node) => node.props['data-topic-event-id'])).toHaveLength(9)
+    expect(buttons(tree, '还有 9983 条事件 · 展开全部')).toHaveLength(1)
+    expect(client.fetch).toHaveBeenCalledTimes(1)
+  })
+
   it('forces a fresh dashboard over an in-flight poll and ignores its later old data and ETag', async () => {
     const namespace = 'dsh:project:test'
     const overview = { namespaces: [{ namespace, events: 21 }] }

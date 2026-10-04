@@ -509,6 +509,8 @@ try {
   assert.deepEqual(requests.filter(({ pathname }) => !readonlyRoutes.has(pathname)), [], 'Browsing invoked a retrieval tool, adoption or model endpoint')
   await Promise.all(responseReads)
   assert.ok(directories.length > 0 && directories.every((directory) => !('events' in directory) && directory.topics.every((topic) => !topic.isFallback)), 'Dashboard exposed an eager Event index or per-Event fallback topics')
+  assert.ok(directories.every((directory) => !JSON.stringify(directory).includes('"sourceEventIds"') && !JSON.stringify(directory).includes('"eventIds"')), 'Directory exposed Event member arrays instead of counts')
+  assert.ok(directories.every((directory) => directory.topics.every((topic) => topic.overview.every((part) => Number.isSafeInteger(part.sourceEventCount))) && (directory.bootstrap?.failures || []).every((failure) => Number.isSafeInteger(failure.eventCount))), 'Directory omitted section or failure counts')
   assert.ok(topicPages.length > 0 && topicPages.every((result) => result.items.length <= 9 && result.limit <= 9 && typeof result.revision === 'string'))
   for (const result of topicPages) {
     for (const item of result.items) assert.deepEqual(Object.keys(item).sort(), ['createdAt', 'id', 'status', 'title'])

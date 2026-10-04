@@ -2213,14 +2213,14 @@ window.__ModuleLoader__.load({
       const [overviewOpen, setOverviewOpen] = React.useState(true)
       const sectionNumber = chapter + '.' + index
       const regionId = 'sg-topic-' + encodeURIComponent(topicId) + '-' + encodeURIComponent(part.uiKey)
-      const sourceIds = [...new Set(part.sourceEventIds || [])]
+      const sourceCount = Number(part.sourceEventCount || 0)
       return h('section', { className: 'sg-topic-section', 'data-section-index': String(index) },
         h('h3', { className: 'sg-topic-section-heading' }, h('button', { type: 'button', className: 'sg-topic-section-toggle', title: part.uiTitle, 'aria-expanded': open, 'aria-controls': regionId, onClick: () => setOpen((current) => !current) },
           h('span', { className: 'sg-directory-number' }, sectionNumber), h('span', null, part.uiTitle), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
         h(DirectoryFold, { open, id: regionId }, h('div', { className: 'sg-topic-section-body' },
           h('div', { className: 'sg-topic-overview' }, h('h4', { className: 'sg-topic-overview-heading' }, h('button', { type: 'button', className: 'sg-topic-overview-toggle', 'aria-expanded': overviewOpen, 'aria-controls': regionId + '-overview', onClick: () => setOverviewOpen((current) => !current) }, h('span', { className: 'sg-directory-number' }, sectionNumber + '.0'), h('span', null, '总览'), h('span', { className: 'sg-directory-chevron', 'aria-hidden': 'true' }, '›'))),
             h(DirectoryFold, { open: overviewOpen, id: regionId + '-overview' }, h('p', { className: 'sg-topic-overview-text' }, part.text || '暂无总览'))),
-          h(TopicEventList, { namespace, revision, topicId, sectionKey: part.uiKey, total: sourceIds.length, active: active && open, openEvent, numberPrefix: sectionNumber, onDirectoryChanged }))))
+          h(TopicEventList, { namespace, revision, topicId, sectionKey: part.uiKey, total: sourceCount, active: active && open, openEvent, numberPrefix: sectionNumber, onDirectoryChanged }))))
     }
 
     function TopicChapter({ topic, number, namespace, revision, active, openEvent, onDirectoryChanged }) {
@@ -2236,9 +2236,8 @@ window.__ModuleLoader__.load({
           topicSections(topic).map((part, index) => h(TopicSection, { key: part.uiKey, part, chapter: number, index: index + 1, topicId: topic.id, namespace, revision, active: active && open, openEvent, onDirectoryChanged })),
           !(topic.overview || []).length ? h('p', { className: 'sg-topic-no-overview' }, '这个主题暂无总览，可查看关联事件。') : null,
           (() => {
-            const summarized = new Set((topic.overview || []).flatMap((part) => part.sourceEventIds || []))
-            const remaining = (topic.sourceEventIds || []).filter((id) => !summarized.has(id))
-            return remaining.length ? h('details', { className: 'sg-topic-other-events', open: otherOpen, onToggle: (event) => setOtherOpen(event.currentTarget.open) }, h('summary', null, '其他关联事件 · ' + remaining.length), h(TopicEventList, { namespace, revision, topicId: topic.id, sectionKey: 'uncovered', total: remaining.length, active: active && open && otherOpen, openEvent, onDirectoryChanged })) : null
+            const remaining = Number(topic.coverage?.omittedEvents || 0)
+            return remaining ? h('details', { className: 'sg-topic-other-events', open: otherOpen, onToggle: (event) => setOtherOpen(event.currentTarget.open) }, h('summary', null, '其他关联事件 · ' + remaining), h(TopicEventList, { namespace, revision, topicId: topic.id, sectionKey: 'uncovered', total: remaining, active: active && open && otherOpen, openEvent, onDirectoryChanged })) : null
           })())))
     }
 
@@ -2256,7 +2255,7 @@ window.__ModuleLoader__.load({
         working && failures ? h('p', { className: 'sg-topic-bootstrap-copy' }, failures + ' 条历史记忆暂未完成整理') : null,
         h(DirectoryFold, { open: detailsOpen, id: 'sg-topic-bootstrap-details' }, h('div', { className: 'sg-topic-failures' },
           (bootstrap.failures || []).map((failure) => h('div', { key: failure.jobId, className: 'sg-topic-failure' }, h('p', null, '自动整理已停止' + (failure.attempts ? ' · 已尝试 ' + failure.attempts + ' 次' : '')),
-            h(TopicEventList, { namespace, revision, topicId: 'pending', sectionKey: 'failure:' + failure.jobId, total: (failure.eventIds || []).length, active: active && detailsOpen, openEvent, onDirectoryChanged }), failure.lastError ? h('details', { className: 'sg-topic-failure-technical' }, h('summary', null, '技术详情'), h('p', null, failure.lastError)) : null)),
+            h(TopicEventList, { namespace, revision, topicId: 'pending', sectionKey: 'failure:' + failure.jobId, total: Number(failure.eventCount || 0), active: active && detailsOpen, openEvent, onDirectoryChanged }), failure.lastError ? h('details', { className: 'sg-topic-failure-technical' }, h('summary', null, '技术详情'), h('p', null, failure.lastError)) : null)),
           !(bootstrap.failures || []).length ? h('p', null, '部分历史记忆暂未形成主题，请从下方待整理事件或事件时间线查看。') : null)))
     }
 
