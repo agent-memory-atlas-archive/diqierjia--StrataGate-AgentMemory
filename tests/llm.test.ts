@@ -4,7 +4,7 @@ import type { EventCard, ExtractionContext, MemoryBlock, TopicProjectionContext,
 import { describe, expect, it, vi } from 'vitest'
 import { ModelJsonResponseError, parseJsonResponse } from '../src/json-response.js'
 import { DshModelBridge } from '../src/llm.js'
-import { emptyProfile } from '@diqier/stratagate'
+import { emptyProfile, StrataGate } from '@diqier/stratagate'
 
 describe('DeepSeek Harness model JSON parsing', () => {
   it('extracts fenced JSON without being confused by braces in strings', () => {
@@ -431,6 +431,41 @@ describe('DeepSeek Harness model JSON retries', () => {
     expect(result.events.map((event) => event.sourceMessageIds)).toEqual([['msg_a'], ['msg_b']])
     expect(result.events[0]).not.toHaveProperty('narrative')
     expect(result.events[0]).not.toHaveProperty('confidence')
+  })
+
+
+  it.each([
+    { item: ['用户', '助手'] }, '用户', 123, ['用户', null], ['用户', 123], ['用户', {}], null,
+    ['用户', '助手'], [],
+  ].map((participants) => ({ participants })))('completes extraction while normalizing runtime participants %j', async ({ participants }) => {
+    const { bridge, session, calls } = modelBridge([
+      { tool: { l0Title: 'SQLite decision', l0Tags: [], l1Summary: 'Use SQLite.', l2Keypoints: [], shouldExtract: true } },
+      { tool: { shouldExtract: true, reason: 'Durable decision.', events: [{
+        title: 'SQLite decision', summary: 'Use SQLite.', sourceMessageIds: ['msg_1'],
+        temporal: { participants, originalText: 'Today', eventType: 'decision' },
+      }] } },
+    ])
+    let id = 0
+    let modelTemporal: unknown
+    const memory = StrataGate.inMemory({
+      blockTurnSize: 1, summarizer: bridge.summarizer,
+      extractor: async (context) => {
+        const result = await bridge.extractor(context)
+        modelTemporal = result.events[0]!.temporal
+        return result
+      },
+      idFactory: (prefix) => `${prefix}_${++id}`,
+    })
+    const result = await bridge.run(session, () => memory.appendTurn({ user: 'Use SQLite.', assistant: 'Recorded.' }))
+    expect(result.extractedEvents).toHaveLength(1)
+    const temporal = result.extractedEvents[0]!.temporal
+    const expected = Array.isArray(participants) && participants.every((item) => typeof item === 'string')
+      ? { participants, originalText: 'Today', eventType: 'decision' }
+      : { originalText: 'Today', eventType: 'decision' }
+    expect(modelTemporal).toEqual(expected)
+    expect(temporal).toEqual(expected)
+    expect(memory.listExtractionJobs()[0]).toMatchObject({ status: 'succeeded', attempts: 1, lastError: null })
+    expect(calls).toHaveBeenCalledTimes(2)
   })
 
   it('uses the final extraction decision for the fallback reason', async () => {

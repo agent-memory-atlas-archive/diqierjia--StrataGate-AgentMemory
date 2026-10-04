@@ -30,7 +30,7 @@ import type {
   TopicProjectionResult,
   TopicProjector,
 } from '@diqier/stratagate'
-import { buildMemoryDerivationMessages, estimateTokens, EXTERNAL_MEMORY_DECIDER_PROMPT_ZH_CN, nowUtc8, parseExternalMemoryExport } from '@diqier/stratagate'
+import { buildMemoryDerivationMessages, estimateTokens, EXTERNAL_MEMORY_DECIDER_PROMPT_ZH_CN, nowUtc8, normalizeEventTemporal, parseExternalMemoryExport } from '@diqier/stratagate'
 import { PROFILE_FIELDS, PROFILE_PROTECTED_SHORT_FIELDS, validateProfile, type PersistentProfile } from '@diqier/stratagate'
 import type { ResolvedConfig, StructuredReasoningEffortMode } from './config.js'
 import { dshMessageSource } from './dsh-compatibility.js'
@@ -600,7 +600,7 @@ Use project scope for repository decisions, user scope for stable preferences/id
         quotes: strings(item.quotes).slice(0, 12),
         sourceMessageIds,
         sourceBlockId: context.target.id,
-        temporal: object(item.temporal),
+        temporal: normalizeEventTemporal(item.temporal),
         scope,
         criticality,
       }

@@ -1,5 +1,32 @@
 import { normalizeSearchText } from './search.js';
-import type { StandardEventType } from './types.js';
+import type { EventTemporal, StandardEventType } from './types.js';
+
+/**
+ * Validate only the runtime shapes consumed by Event code. Keep valid values
+ * unchanged; discard malformed fields without discarding the Event.
+ */
+export function normalizeEventTemporal(value: unknown): EventTemporal {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const temporal = { ...value } as EventTemporal;
+  for (const field of [
+    'mentionedAt', 'happenedStart', 'happenedEnd', 'originalText',
+    'precision', 'basis', 'status', 'eventType', 'threadId', 'sameEventId',
+  ] as const) {
+    if (typeof temporal[field] !== 'string') delete temporal[field];
+  }
+  for (const field of [
+    'participants', 'participantNodeIds', 'beforeEventIds', 'afterEventIds',
+    'supersedesEventIds', 'conflictsWithEventIds', 'relatedEventIds',
+  ] as const) {
+    const values = temporal[field];
+    if (Array.isArray(values) && [...values].every((item) => typeof item === 'string')) {
+      temporal[field] = [...values];
+    } else {
+      delete temporal[field];
+    }
+  }
+  return temporal;
+}
 
 /** Maps multilingual/free-text legacy labels into the stable Event taxonomy. */
 export function normalizeStandardEventType(value: string | undefined): StandardEventType {

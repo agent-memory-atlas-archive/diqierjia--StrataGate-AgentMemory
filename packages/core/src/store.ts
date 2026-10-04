@@ -8,7 +8,7 @@ import {
   normalizeBlockLevel,
 } from './blocks.js';
 import { applyElementChanges, elementViewAt } from './elements.js';
-import { normalizeStandardEventType } from './events.js';
+import { normalizeEventTemporal, normalizeStandardEventType } from './events.js';
 import { externalMemoryJsonExtractor, parseExternalMemoryExport } from './external-memory.js';
 import { GRAPH_PROVENANCE_LIMIT, applyGraphProjection, boundEffectiveGraphNodeView, effectiveGraphNodeView, graphTimeline } from './graph.js';
 import { normalizeRetrievalAssessment, type RetrievalAssessment, type RetrievalAssessmentInput } from './retrieval.js';
@@ -1441,6 +1441,8 @@ export class StrataGate {
     options: SearchOptions,
     limit: number,
   ): EventCard[] {
+    // Last line of defense for runtime mutations or custom integrations.
+    for (const event of candidates) event.temporal = normalizeEventTemporal(event.temporal);
     const participants = (options.participants ?? []).map(normalizeSearchText).filter(Boolean);
     const eventType = normalizeSearchText(options.eventType ?? '');
     const from = options.happenedFrom ? Date.parse(options.happenedFrom) : Number.NEGATIVE_INFINITY;
@@ -1592,7 +1594,7 @@ export class StrataGate {
       job.lastError = null;
       job.updatedAt = toUtc8Iso(this.now());
       const eventText = normalizeSearchText(events.map((event) => [
-        event.title, event.summary, event.tags.join(' '), (event.temporal.participants ?? []).join(' '),
+        event.title, event.summary, event.tags.join(' '), (normalizeEventTemporal(event.temporal).participants ?? []).join(' '),
       ].join(' ')).join(' '));
       const effectiveViews = this.graphNodes.flatMap((node) => effectiveGraphNodeView(node, this.graphEdges, this.listAllEvents()) ?? []);
       const effectiveNodes = effectiveViews.map(({ node }) => node);
@@ -2343,6 +2345,7 @@ export class StrataGate {
       criticality: MemoryCriticality
     },
   ): EventCard {
+    const temporal = normalizeEventTemporal(input.temporal);
     const event: EventCard = {
       id: input.id ?? this.idFactory('evt'),
       formedTurn: parts.formedTurn,
@@ -2353,8 +2356,8 @@ export class StrataGate {
       sourceMessageIds: parts.sourceMessageIds,
       ...(parts.sourceBlockId !== undefined ? { sourceBlockId: parts.sourceBlockId } : {}),
       temporal: {
-        ...(input.temporal ? { ...input.temporal } : { mentionedAt: parts.now }),
-        eventType: normalizeStandardEventType(input.temporal?.eventType),
+        ...(input.temporal ? temporal : { mentionedAt: parts.now }),
+        eventType: normalizeStandardEventType(temporal.eventType),
       },
       scope: input.scope ?? 'user',
       criticality: parts.criticality,
@@ -2936,7 +2939,7 @@ export class StrataGate {
         previous: threadBlocks.slice(0, targetIndex).reverse().find((block) => block.l2Keypoints !== undefined) ?? null,
         target,
         next,
-        timeline: [...timelineEvents.values()].map((event) => ({ id: event.id, title: event.title, temporal: structuredClone(event.temporal) })),
+        timeline: [...timelineEvents.values()].map((event) => ({ id: event.id, title: event.title, temporal: normalizeEventTemporal(structuredClone(event.temporal)) })),
       });
     } catch (error) {
       await this.commitMutation(() => {
