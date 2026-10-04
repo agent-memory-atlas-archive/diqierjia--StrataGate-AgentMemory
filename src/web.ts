@@ -544,13 +544,26 @@ function topicDirectoryProjection(snapshot: StrataGateSnapshot, agentMemoryWeigh
   return {
     visibleEvents,
     pending,
+    chapters,
+    failures,
     data: {
       navigationOnly: true as const,
       revision,
       context: renderMemoryDirectory(topics, visibleEvents),
-      topics: chapters,
+      topics: chapters.map((topic) => ({
+        id: topic.id, title: topic.title, description: topic.description,
+        createdAt: topic.createdAt, updatedAt: topic.updatedAt,
+        coverage: { ...topic.coverage },
+        overview: topic.overview.map((part) => ({
+          kind: part.kind, text: part.text,
+          sourceEventCount: new Set(part.sourceEventIds).size,
+        })),
+      })),
       pending: { total: pending.length },
-      bootstrap,
+      bootstrap: bootstrap ? {
+        ...bootstrap,
+        failures: failures.map(({ eventIds, ...failure }) => ({ ...failure, eventCount: eventIds.length })),
+      } : null,
     },
   }
 }
@@ -609,13 +622,13 @@ async function topicEvents(runtime: StrataGateRuntime, url: URL): Promise<unknow
   if (topicId === 'pending') {
     if (sectionKey === null) ids = projection.pending.map(({ id }) => id)
     else if (sectionKey.startsWith('failure:')) {
-      const failure = data.bootstrap?.failures.find(({ jobId }) => jobId === sectionKey.slice('failure:'.length))
+      const failure = projection.failures.find(({ jobId }) => jobId === sectionKey.slice('failure:'.length))
       if (!failure) throw new AdminHttpError(404, 'Unknown or unavailable Topic failure')
       const pendingIds = new Set(projection.pending.map(({ id }) => id))
       ids = failure.eventIds.filter((id) => pendingIds.has(id))
     } else throw new AdminHttpError(404, 'Unknown or unavailable pending Topic section')
   } else {
-    const topic = data.topics.find(({ id }) => id === topicId)
+    const topic = projection.chapters.find(({ id }) => id === topicId)
     if (!topic) throw new AdminHttpError(404, 'Unknown or unavailable memory topic')
     if (sectionKey === null) ids = topic.sourceEventIds
     else if (sectionKey === 'uncovered') {

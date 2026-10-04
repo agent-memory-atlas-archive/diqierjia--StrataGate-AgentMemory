@@ -90,7 +90,7 @@ async function request(runtime: StrataGateRuntime, path = 'topics', method = 'GE
 }
 
 describe('read-only Topic Directory admin data', () => {
-  it('exposes every chapter and reference while loading Event titles in bounded pages', async () => {
+  it('exposes every chapter with counts while loading Event references in bounded pages', async () => {
     const snapshot = emptySnapshot()
     snapshot.events = Array.from({ length: 60 }, (_, index) => event(`event-${String(index).padStart(3, '0')}`))
     const state = freeze(snapshot.events)
@@ -106,7 +106,9 @@ describe('read-only Topic Directory admin data', () => {
     expect(directory.topics.filter((item: { isFallback?: boolean }) => !item.isFallback)
       .map((item: { id: string }) => item.id)).toEqual(['topic-a', 'topic-b'])
     expect(directory.topics).toHaveLength(2)
-    expect(directory.topics.find((item: { id: string }) => item.id === 'topic-b').overview[0].sourceEventIds).toHaveLength(20)
+    expect(directory.topics.find((item: { id: string }) => item.id === 'topic-b').overview[0].sourceEventCount).toBe(20)
+    expect(JSON.stringify(directory)).not.toContain('"sourceEventIds"')
+    expect(JSON.stringify(directory)).not.toContain('"eventIds"')
     expect(directory).not.toHaveProperty('events')
     expect(directory.pending).toEqual({ total: 10 })
     expect(directory.revision).toMatch(/^[a-f0-9]{64}$/)
@@ -153,6 +155,77 @@ describe('read-only Topic Directory admin data', () => {
     expect(page.body.items).toHaveLength(9)
     for (const item of page.body.items) expect(Object.keys(item)).toEqual(['id', 'title', 'status', 'createdAt'])
   }, 30_000)
+
+  it.each([2_000, 10_000])('keeps a formal Topic with %i members count-only while retaining server-side pagination', async (count) => {
+    const snapshot = emptySnapshot()
+    snapshot.events = Array.from({ length: count }, (_, index) => event(`member-${String(index).padStart(5, '0')}`))
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    const chapter = topic('large-topic', snapshot.events)
+    chapter.overview[0]!.sourceEventIds = snapshot.events.slice(0, 12).map(({ id }) => id)
+    snapshot.memoryTopicState.topics = [chapter]
+    snapshot.memoryTopicState.projectedVersions = versions(snapshot.events)
+    const runtime = fakeRuntime(snapshot)
+    const before = JSON.stringify(snapshot)
+    const result = await request(runtime, 'dashboard')
+    const directory = result.body.data.topicDirectory
+    expect(directory.topics).toHaveLength(1)
+    expect(directory.topics[0].coverage).toEqual({ totalEvents: count, summarizedEvents: 12, omittedEvents: count - 12 })
+    expect(directory.topics[0].overview[0].sourceEventCount).toBe(12)
+    expect(directory.pending.total).toBe(0)
+    const serialized = JSON.stringify(directory)
+    expect(serialized).not.toContain('"sourceEventIds"')
+    expect(serialized).not.toContain('"eventIds"')
+    expect(serialized).not.toContain('member-00000')
+    expect(serialized).not.toContain(`member-${String(count - 1).padStart(5, '0')}`)
+    expect(serialized.length).toBeLessThan(4_000)
+    expect((await request(runtime)).body).toEqual({ namespace, ...directory })
+    const page = await request(runtime, `topic-events&topicId=large-topic&sectionKey=uncovered&expectedRevision=${directory.revision}`)
+    expect(page.body).toMatchObject({ total: count - 12, limit: 9, offset: 0, nextOffset: 9 })
+    expect(page.body.items.map((item: { id: string }) => item.id)).toEqual(snapshot.events.slice(12, 21).map(({ id }) => id))
+    const tail = await request(runtime, `topic-events&topicId=large-topic&offset=${count - 1}&expectedRevision=${directory.revision}`)
+    expect(tail.body).toMatchObject({ total: count, nextOffset: null, items: [{ id: snapshot.events[count - 1]!.id }] })
+    expect(JSON.stringify(snapshot)).toBe(before)
+  }, 30_000)
+
+  it('does not expose Event ID arrays even in oversized overview and failure records', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = Array.from({ length: 2_000 }, (_, index) => event(`private-member-${index}`))
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    snapshot.memoryTopicState.topics = [topic('large-overview', snapshot.events)]
+    snapshot.memoryTopicState.projectedVersions = versions(snapshot.events)
+    const overviewDirectory = (await request(fakeRuntime(snapshot))).body
+    expect(overviewDirectory.topics[0].overview[0].sourceEventCount).toBe(2_000)
+    expect(JSON.stringify(overviewDirectory)).not.toContain('"sourceEventIds"')
+    expect(JSON.stringify(overviewDirectory).length).toBeLessThan(4_000)
+
+    snapshot.memoryTopicState.topics = []
+    snapshot.memoryTopicState.projectedVersions = {}
+    snapshot.memoryTopicState.jobs = [failedJob('large-failure', snapshot.events)]
+    const runtime = fakeRuntime(snapshot)
+    const failureDirectory = (await request(runtime)).body
+    expect(failureDirectory.bootstrap.failures[0].eventCount).toBe(2_000)
+    expect(JSON.stringify(failureDirectory)).not.toContain('"eventIds"')
+    expect(JSON.stringify(failureDirectory).length).toBeLessThan(4_000)
+    const page = await request(runtime, `topic-events&topicId=pending&sectionKey=failure:large-failure&expectedRevision=${failureDirectory.revision}`)
+    expect(page.body).toMatchObject({ total: 2_000, limit: 9, nextOffset: 9 })
+    expect(page.body.items).toHaveLength(9)
+  }, 30_000)
+
+  it('changes revision on same-count membership reorder without exposing the member IDs', async () => {
+    const snapshot = emptySnapshot()
+    snapshot.events = [event('member-a'), event('member-b')]
+    snapshot.memoryTopicState = freeze(snapshot.events)
+    snapshot.memoryTopicState.topics = [topic('chapter', snapshot.events)]
+    snapshot.memoryTopicState.projectedVersions = versions(snapshot.events)
+    const runtime = fakeRuntime(snapshot)
+    const first = (await request(runtime)).body
+    snapshot.memoryTopicState.topics[0]!.sourceEventIds.reverse()
+    const second = (await request(runtime)).body
+    expect(second.topics).toEqual(first.topics)
+    expect(second.revision).not.toBe(first.revision)
+    expect((await request(runtime, `topic-events&topicId=chapter&expectedRevision=${first.revision}`)).status).toBe(409)
+    expect((await request(runtime, `topic-events&topicId=chapter&expectedRevision=${second.revision}`)).body.items.map((item: { id: string }) => item.id)).toEqual(['member-b', 'member-a'])
+  })
 
   it('retains source order for sections, uncovered members and duplicate-kind occurrences', async () => {
     const snapshot = emptySnapshot()
@@ -373,7 +446,7 @@ describe('read-only Topic Directory admin data', () => {
     const result = await request(fakeRuntime(snapshot))
     expect(result.body.bootstrap).toMatchObject({
       status: 'completed', total: 2, completed: 1, failedEvents: 1,
-      failures: [{ jobId: 'failed-job', eventIds: ['failed'], attempts: 3, lastError: 'worker-failed' }],
+      failures: [{ jobId: 'failed-job', eventCount: 1, attempts: 3, lastError: 'worker-failed' }],
     })
     expect(JSON.stringify(result.body)).not.toContain('RAW SECRET MODEL RESPONSE')
     expect(result.body.bootstrap.failures[0]).not.toHaveProperty('context')

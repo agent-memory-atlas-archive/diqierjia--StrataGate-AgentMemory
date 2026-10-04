@@ -16,6 +16,24 @@ function source(id: string, eventType: string): EventCard {
 }
 
 describe('shared memory directory order', () => {
+  it('keeps same-batch chapters in immutable ID order when their titles change', () => {
+    const first = topic('topic_a', '2026-10-01T00:00:00.000Z')
+    const second = topic('topic_b', first.createdAt)
+    first.title = '甲主题'
+    second.title = '乙主题'
+    const topics = [second, first]
+    const expected = ['topic_a', 'topic_b']
+    expect(sortMemoryTopics(topics).map(({ id }) => id)).toEqual(expected)
+    first.title = 'Z renamed'
+    second.title = 'A renamed'
+    first.updatedAt = '2026-10-04T00:00:00.000Z'
+    expect(sortMemoryTopics(topics).map(({ id }) => id)).toEqual(expected)
+    expect(topicNavigation(topics, []).entries.map(({ id }) => id)).toEqual(expected)
+    expect(topicPage(topics, []).topics.map(({ id }) => id)).toEqual(expected)
+    const context = renderMemoryDirectory(topics, [])
+    expect(context.indexOf('- topic_a：')).toBeLessThan(context.indexOf('- topic_b：'))
+  })
+
   it('appends newly created topics even when their generated id sorts before existing chapters', () => {
     const first = topic('topic_z', '2026-10-01T00:00:00.000Z')
     const second = topic('topic_b', '2026-10-02T00:00:00.000Z')
