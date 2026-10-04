@@ -1,7 +1,6 @@
 import { BLOCK_DECAY_LAMBDA } from './blocks.js';
 import { normalizeStandardEventType } from './events.js';
 import type { ElementCard, EventCard, ExternalMemoryImportJob, GraphEdge, GraphNode, MemoryBlock, RawMessage } from './types.js';
-import type { MemoryTopicState } from './topics.js';
 
 export const STRATAGATE_STORAGE_SCHEMA_VERSION = 12;
 export const KNOWLEDGE_GRAPH_PROJECTOR_VERSION = 1;
@@ -40,7 +39,7 @@ export interface BlockSummaryJob {
   updatedAt: string;
 }
 
-export type SuccessfulModelResponseKind = 'summarizer' | 'extractor' | 'projector' | 'graphProjector' | 'topicProjector' | 'externalMemoryExtractor' | 'externalMemoryDecider' | 'profileMaintenance';
+export type SuccessfulModelResponseKind = 'summarizer' | 'extractor' | 'projector' | 'graphProjector' | 'externalMemoryExtractor' | 'externalMemoryDecider' | 'profileMaintenance';
 
 export interface SuccessfulModelResponse {
   id: string;
@@ -137,8 +136,6 @@ export interface StrataGateSnapshot {
   ingestionReceipts: IngestionReceipt[];
   externalMemoryImportJobs: ExternalMemoryImportJob[];
   successfulModelResponses?: SuccessfulModelResponse[];
-  /** Optional rebuildable projection; schema-12 snapshots without it stay valid. */
-  memoryTopicState?: MemoryTopicState;
 }
 
 export interface LoadedStrataGateState {
@@ -152,8 +149,6 @@ export interface RawMessageIndexDelta {
 }
 
 export interface StorageAdapter {
-  /** Read-only adapters never initialize or recover writer-owned state. */
-  readonly readonly?: boolean;
   load(namespace: string): Promise<LoadedStrataGateState | null>;
   save(
     namespace: string,
